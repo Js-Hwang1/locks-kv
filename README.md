@@ -1,6 +1,6 @@
-# AMASS
+# LOCKS
 
-**Decode-time sparse KV-cache attention for vLLM.** AMASS keeps LLM decoding
+**Decode-time sparse KV-cache attention for vLLM.** LOCKS keeps LLM decoding
 fast and memory-light at long context by attending, at every decode step, to
 only the pages that actually carry attention mass: a compact per-page score
 selects a small working set (typically 5 to 10 percent of the KV cache), and a
@@ -12,7 +12,7 @@ time-to-first-token is unchanged.
 
 ## What is in the box
 
-AMASS has two parts that share one selection core:
+LOCKS has two parts that share one selection core:
 
 1. **The quad selector (Stage A).** A quadratic, Gaussian-MGF page score built
    from a tiny per-page summary. "quad" drops the per-key coordinates and stores
@@ -28,29 +28,29 @@ AMASS has two parts that share one selection core:
 
 | Variant       | KV residency                                  | The play          |
 | ------------- | --------------------------------------------- | ----------------- |
-| **AMASS-fast** | K+V resident in VRAM                          | speed             |
-| **AMASS-mem**  | V (mem-v) or K+V (mem-kv) offloaded to DRAM; only the quad summary + called pages resident | memory + speed |
+| **LOCKS-fast** | K+V resident in VRAM                          | speed             |
+| **LOCKS-mem**  | V (mem-v) or K+V (mem-kv) offloaded to DRAM; only the quad summary + called pages resident | memory + speed |
 
 ## Install
 
 ```bash
-pip install amass-kv
+pip install locks-kv
 ```
 
-The import name is `amass`:
+The import name is `locks`:
 
 ```python
-import amass
-print(amass.__version__)
+import locks
+print(locks.__version__)
 ```
 
-`amass-kv` declares `torch` and `triton` as its runtime dependencies. vLLM is an
-**optional extra** (see [Dependencies](#dependencies)); install AMASS into your
+`locks-kv` declares `torch` and `triton` as its runtime dependencies. vLLM is an
+**optional extra** (see [Dependencies](#dependencies)); install LOCKS into your
 existing vLLM environment, or pull a compatible engine with:
 
 ```bash
-pip install "amass-kv[vllm]"     # engine + plugin
-pip install "amass-kv[all]"      # + transformers (bench) + pyyaml (yaml configs)
+pip install "locks-kv[vllm]"     # engine + plugin
+pip install "locks-kv[all]"      # + transformers (bench) + pyyaml (yaml configs)
 ```
 
 Requires Python >= 3.10 and an NVIDIA GPU. The hot-path CUDA kernels are
@@ -59,25 +59,25 @@ compiled once at first use via `torch.utils.cpp_extension` (targeting Hopper,
 
 ## Quickstart
 
-AMASS installs as a vLLM **general plugin**, so once the wheel is present vLLM
-auto-registers it at engine startup with no code change: AMASS patches itself in
+LOCKS installs as a vLLM **general plugin**, so once the wheel is present vLLM
+auto-registers it at engine startup with no code change: LOCKS patches itself in
 wherever vLLM would have chosen the FlashAttention backend. Configuration is a
-single `AmassConfig`, sourced from the `AMASS_CONFIG` environment variable (an
+single `LocksConfig`, sourced from the `LOCKS_CONFIG` environment variable (an
 inline JSON string, or a path to a JSON/YAML file):
 
 ```bash
-# Run any vLLM entry point (serve / offline) with AMASS active.
-export AMASS_CONFIG='{"variant": "fast", "coverage": 0.95}'
+# Run any vLLM entry point (serve / offline) with LOCKS active.
+export LOCKS_CONFIG='{"variant": "fast", "coverage": 0.95}'
 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 # The memory play: offload V to DRAM, keep K resident.
-export AMASS_CONFIG='{"variant": "mem-v", "coverage": 0.95}'
+export LOCKS_CONFIG='{"variant": "mem-v", "coverage": 0.95}'
 
-# Turn AMASS off (stock FlashAttention / FullKV reference line):
-export AMASS_DISABLE=1
+# Turn LOCKS off (stock FlashAttention / FullKV reference line):
+export LOCKS_DISABLE=1
 ```
 
-Key `AmassConfig` fields: `variant` (`fast` / `mem-v` / `mem-kv`), `coverage`
+Key `LocksConfig` fields: `variant` (`fast` / `mem-v` / `mem-kv`), `coverage`
 (adaptive per-head nucleus coverage over exact page masses; default 0.95) or
 `budget` (a fixed selected-page fraction), `score` (`quad` default, or the `r8`
 low-rank fallback), and `use_cuda` (hand-CUDA hot path vs Triton reference).
@@ -90,7 +90,7 @@ low-rank fallback), and `use_cuda` (hand-CUDA hot path vs Triton reference).
 - **Near-lossless on LongBench.** quad at a 5 percent per-step budget lands
   within noise of FullKV (LongBench-v1 delta about -0.22 for quad vs -0.38 for
   r8 at the same budget; about -0.29 at coverage 0.95 across 14 subsets).
-- **Faster in the regime that matters.** AMASS-fast beats dense FlashAttention-3
+- **Faster in the regime that matters.** LOCKS-fast beats dense FlashAttention-3
   in the **long-context, high-batch** decode regime by up to about **2x**, and
   is at **parity at batch size 1** (the hot path is bandwidth-bound and only
   pulls ahead once the dense KV read dominates). It does not claim >=2x
@@ -98,28 +98,28 @@ low-rank fallback), and `use_cuda` (hand-CUDA hot path vs Triton reference).
 - **76 to 92 percent VRAM saved** in the mem variant, by holding only the quad
   summary plus the called pages resident and serving the rest of V from DRAM.
 
-Numbers are per-kernel and end-to-end reproducible with `amass-bench` (below).
+Numbers are per-kernel and end-to-end reproducible with `locks-bench` (below).
 See the paper for the full protocol, benchmarks (RULER, LongBench v1/v2,
 SCBench, a reasoning suite), and ablations.
 
 - Paper: see the project page linked in this repository.
 
-## Benchmarking: `amass-bench`
+## Benchmarking: `locks-bench`
 
 The wheel ships a benchmarker so the latency claims are reproducible on any
 Hopper box with one command:
 
 ```bash
-amass-bench kernels --quick    # per-kernel: r8_score / topb / decode, CUDA vs Triton vs dense-FA
-amass-bench e2e --ctx 16384    # end-to-end decode-step TPOT in a real vLLM run
-amass-bench all --json out.json
-python -m amass.bench kernels  # identical to the console entry point
+locks-bench kernels --quick    # per-kernel: r8_score / topb / decode, CUDA vs Triton vs dense-FA
+locks-bench e2e --ctx 16384    # end-to-end decode-step TPOT in a real vLLM run
+locks-bench all --json out.json
+python -m locks.bench kernels  # identical to the console entry point
 ```
 
-`amass-bench e2e` needs the `bench` + `vllm` extras (it tokenizes a real model
+`locks-bench e2e` needs the `bench` + `vllm` extras (it tokenizes a real model
 and spins up an engine). Timing is CUDA-event based with warmup and medians, and
 reports both eager and CUDA-graph-replay speedups plus an HBM roofline for the
-bandwidth-bound score kernel. Full flag reference: `amass-bench --help`.
+bandwidth-bound score kernel. Full flag reference: `locks-bench --help`.
 
 ## Dependencies
 
@@ -128,10 +128,10 @@ bandwidth-bound score kernel. Full flag reference: `amass-bench --help`.
 | `torch`        | tensors + runtime CUDA (`load_inline`) kernels   | hard (`>=2.4`)            |
 | `triton`       | reference / fallback kernels                     | hard (`>=3.0`)            |
 | `vllm`         | plugin host + attention backend                  | extra `[vllm]` (`>=0.8`)  |
-| `transformers` | `amass-bench e2e` tokenizer (lazy import)         | extra `[bench]`           |
-| `pyyaml`       | YAML `AMASS_CONFIG` files (JSON needs no dep)      | extra `[yaml]`            |
+| `transformers` | `locks-bench e2e` tokenizer (lazy import)         | extra `[bench]`           |
+| `pyyaml`       | YAML `LOCKS_CONFIG` files (JSON needs no dep)      | extra `[yaml]`            |
 
-`numpy` is **not** a direct dependency: nothing under `amass/` imports it; it
+`numpy` is **not** a direct dependency: nothing under `locks/` imports it; it
 arrives transitively through torch. vLLM is an extra rather than a hard floor
 because it is a heavy, CUDA-ABI-sensitive wheel that production deployments pin
 themselves, and a hard floor could silently upgrade a pinned engine.

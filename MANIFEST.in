@@ -9,7 +9,7 @@ include pyproject.toml
 
 # Ship every Python source under the package (the runtime CUDA kernels are
 # `.py` files that `load_inline` at import time, so they MUST be included).
-recursive-include src/amass *.py
+recursive-include src/locks *.py
 
 # Keep dev-only notes and byte-compiled / scratch junk out of the release.
 recursive-exclude src *.md
