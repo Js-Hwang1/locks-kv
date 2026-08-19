@@ -61,7 +61,11 @@ class LocksConfig:
     # 5d + 10*page + 18 B per (page, kv-head): ~820 B at (d=128, page 16) =
     # ~9.4% of the 8 KB bf16 K+V page; ~978 B = ~6.0% at page 32.  CUDA-only
     # (no Triton reference exists).  Supported geometry (TORCH_CHECKed at
-    # wiring): d in {64, 128, 256}, page in {16, 32}, G <= 8 query heads per
+    # wiring): d in {64, 128, 256}, page in {16, 32, 64} (64 = six-slab
+    # lane only; CUDA score/decode + AOS records stay {16,32}), rank any
+    # integer in [1, page-1] (LOCKS_R8I4_RANK; CUDA kernel stays {2,4,8}),
+    # V-basis bits in {2, 4, 8} (LOCKS_R8I4_IBITS; CUDA + AOS stay i4),
+    # G <= 8 query heads per
     # kv head (the fused nrm+topb selector's bound; validate_geometry enforces
     # it at wiring time -- G and n_kv are runtime parameters).
     #

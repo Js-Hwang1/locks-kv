@@ -26,6 +26,11 @@ from .r8i4_build import (r8i4_build_bulk, r8i4_build_delta,
                          r8i4_build_refresh, r8i4_build_tail)
 from .r8i4_state import R8i4State, TAGW
 from .select import derive_page_params, topb_select
+# MLA (DeepSeek V2/V3/V3.2) selection surface -- the latent-cache analog of the
+# GQA path. Scorer + top-b keep + the single mla_select_pages entry the LOCKS
+# MLA backend forwards to.
+from .mla_score_torch import mla_page_score_ref, topb_middle
+from .mla_select import build_page_summary, mla_page_score, mla_select_pages
 
 __all__ = [
     "R8i4State",
@@ -36,4 +41,10 @@ __all__ = [
     "r8i4_build_delta",
     "derive_page_params",
     "topb_select",
+    # MLA
+    "mla_page_score_ref",
+    "topb_middle",
+    "build_page_summary",
+    "mla_page_score",
+    "mla_select_pages",
 ]

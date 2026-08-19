@@ -73,12 +73,14 @@ _SRC = r"""
 #if RNK != 8 && RNK != 4 && RNK != 2
 #error "RNK must be 8, 4, or 2"
 #endif
-// RNK<8 support scope (rank campaign v1, doc 19/21): the MMA+AOS entries
-// only. The dp4a S4 path and six-slab arms keep rank-8 layout assumptions
-// (uint2 coeff loads); python guards route RNK<8 to bt_aos exclusively.
-#if RNK != 8 && !defined(R8I4_MMA_AOS)
-#error "RNK != 8 requires the R8I4_MMA_AOS build (rank campaign v1 scope)"
-#endif
+// RNK<8 support scope (rank campaign v2, 2026-07-27, user ruling "r4/r2
+// must never be worse than r8 at ANY context"): the six-slab flagship lane
+// is now rank-parametric too -- coeff loads take the RNK-width pattern the
+// AOS reader already used, V/vs column reads clamp to the RNK live columns,
+// and the mma epilogue gates dead output columns (verbatim the AOS branch's
+// gating). rank<8 therefore rides r8's EXACT lane set at every ctx
+// (six-slab+HMAX/SEL_V2/CO at <512K, AOS+PFR at >=512K) with strictly
+// fewer bytes. v1's "MMA+AOS entries only" #error is retired.
 #if RNK != 8 && (defined(R8I4_MMA_S1PROBE) || defined(R8I4_CP_NODT) || defined(R8I4_CP_NOEXP))
 #error "RNK != 8 excludes V8/probe builds (rank campaign v1 scope)"
 #endif
@@ -217,6 +219,21 @@ __device__ __forceinline__ unsigned r8_hi(unsigned w) {
 #if defined(R8I4_MMA_MUC) && (RNK == 8 || !defined(R8I4_MMA_AOS) || !defined(R8I4_MMA_BIAS) || defined(R8I4_MMA_S1PROBE))
 #error "R8I4_MMA_MUC stage 1 covers RNK<8 AOS+BIAS builds only"
 #endif
+// ALLG (general tensor-core projection, G in {4, 8}): scoped to the AOS+BIAS
+// build (the six-slab loop stays G8-flagship). MUC is excluded: mu rides the
+// mma's dead basis columns in a G8-fragment order the G4 tile does not read
+// (and PK2 wants those columns for page packing). FOLDR is excluded in v1:
+// its epilogue publishes the b-octet fold rows unconditionally (G4 models cap
+// at 128K ctx; FOLDR is a >=512K arm, so nothing in the zoo needs the combo).
+#if defined(R8I4_MMA_ALLG) && (!defined(R8I4_MMA_AOS) || !defined(R8I4_MMA_BIAS))
+#error "R8I4_MMA_ALLG requires the R8I4_MMA_AOS + R8I4_MMA_BIAS build"
+#endif
+#if defined(R8I4_MMA_ALLG) && defined(R8I4_MMA_MUC)
+#error "R8I4_MMA_ALLG excludes R8I4_MMA_MUC (set LOCKS_R8I4_MUC=0)"
+#endif
+#if defined(R8I4_MMA_ALLG) && defined(R8I4_MMA_FOLDR)
+#error "R8I4_MMA_ALLG v1 excludes R8I4_MMA_FOLDR (b-octet fold rows)"
+#endif
 // R8I4_MMA_SCREEN (doc 26): certified-screen kernel. Needs the AOS record
 // (+ the nrmC pad field) and the BIAS int-mma; FLAT-domain semantics.
 #if defined(R8I4_MMA_SCREEN) && (!defined(R8I4_MMA_AOS) || !defined(R8I4_MMA_BIAS))
@@ -313,10 +330,19 @@ void r8i4_score_kernel(
     // 94->127us @256K). The register-free MLP path (cp.async staging) is used
     // instead (below). So PIPE stays G4-only.
 #ifdef R8I4_MMA
-    // int8 tensor-core projection: only the flagship G8 d128 group (M=8 heads,
-    // N=8 basis, K=128 map exactly onto m16n8k32). Every other geometry keeps
-    // the dp4a path (compile-time, not a runtime branch).
+#ifdef R8I4_MMA_ALLG
+    // ALLG (rank campaign v2, 2026-07-26): the int8 tensor-core projection for
+    // EVERY GQA group size at d128, not just the G8 flagship -- G<8 models
+    // (Llama/Qwen G4 class) ride the same m16n8k32 chain with the dead A rows
+    // (heads >= G) zeroed at staging and the b-octet tile elided at G <= 4.
+    // The mma is integer-exact, so score_h is BITWISE equal to the dp4a
+    // score_tile path it replaces (gate: tests/gate_rank_mma.py). The G8
+    // instantiation compiles VERBATIM the non-ALLG source (guards live only
+    // in the G4-template branch) -> flagship codegen untouched.
+    constexpr bool USE_MMA = (G8 || G4) && (DHEAD == 128);
+#else
     constexpr bool USE_MMA = G8 && (DHEAD == 128);
+#endif
 #else
     constexpr bool USE_MMA = false;
 #endif
@@ -458,6 +484,18 @@ void r8i4_score_kernel(
         Af[2][2] = q8o[gidm][4 + t4m];  Af[2][3] = 0u;
         Af[3][0] = q8o[gidm][8 + t4m];  Af[3][1] = 0u;
         Af[3][2] = q8o[gidm][12 + t4m]; Af[3][3] = 0u;
+#ifdef R8I4_MMA_ALLG
+        // ALLG: heads >= G have UNINITIALIZED q8e/q8o rows (staging loops run
+        // gg < G only). Zero their A fragments so the dead C rows are exact
+        // zeros, not garbage. Compiled ONLY into the G4-template instantiation
+        // (G8 promises G == 8): the flagship SASS stays verbatim.
+        if constexpr (G4) {
+            if (gidm >= G) {
+                #pragma unroll
+                for (int f = 0; f < 4; ++f) { Af[f][0] = 0u; Af[f][2] = 0u; }
+            }
+        }
+#endif
 #ifdef R8I4_MMA_BIAS
         // Biased-nibble mma: feed the raw nibble (V+8) to drop the 8 __vsub4/
         // page (ALU), fold the +8 plane out exactly in the epilogue via
@@ -469,6 +507,12 @@ void r8i4_score_kernel(
         qsum_mma += __shfl_xor_sync(~0u, qsum_mma, 1);
         qsum_mma += __shfl_xor_sync(~0u, qsum_mma, 2);
         qsum_mma *= 8;                              // pre-scale the fold-out
+#ifdef R8I4_MMA_ALLG
+        // ALLG: q8d rows >= G are uninitialized -> force the dead heads'
+        // fold-out to 0 (their acc rows are exact 0 from the zeroed A frags,
+        // and 0 - 0 keeps the dead qt slots exactly 0). G4-template only.
+        if constexpr (G4) { if (gidm >= G) qsum_mma = 0; }
+#endif
 #endif
     }
 #endif
@@ -486,8 +530,80 @@ void r8i4_score_kernel(
                          __nv_bfloat16& sv, __nv_bfloat16& smu,
                          __nv_bfloat16* sc) {
         const long row = row_of(pp);
+#ifdef R8I4_MMA_AOS
+        // ---- G4 (non-MMA) AOS record reader ---------------------------- //
+        // The six summary components live in ONE 64B-aligned record per
+        // (page, kv-head); the AOS launch passes ONLY that record (via v4)
+        // and nullptr for vs/c8/cs/mu8/mus, so the six-array reads below
+        // (the #else) faulted.  Read every field from the record at the
+        // compile-time RO_* offsets (mirroring the G8 mma loop / the
+        // r8i4_state layout) with a per-lane stride that stays naturally
+        // aligned AND in-bounds for RNK in {2, 4, 8}: the pre-AOS uint2 C
+        // read was BOTH null and (at RNK<8, whose token stride is RNK<8
+        // bytes) misaligned.  The basis columns exist only for rr < RNK, so
+        // the V column and the vs scale are read at a clamped column index
+        // (in-bounds) and compute_page forces qt = 0 for lanes rr >= RNK,
+        // which makes those clamped bytes inert in the token sum.
+        constexpr int  RO_MU_L  = RNK * (DHEAD / 2);
+        constexpr int  RO_C8_L  = RO_MU_L + DHEAD;
+        constexpr int  RO_CS_L  = RO_C8_L + RNK * PGT;
+        constexpr int  RO_VS_L  = RO_CS_L + 2 * PGT;
+        constexpr int  RO_MUS_L = RO_VS_L + 2 * RNK;
+        constexpr long RECB_L   = ((RO_MUS_L + 2) + 63) / 64 * 64;
+        const uint8_t* p_rec = v4 + row * RECB_L;
+        const int vc = (rr < RNK) ? rr : (RNK - 1);        // clamp to V region
         const uint4* colv = reinterpret_cast<const uint4*>(
-            v4 + (row * RNK + rr) * (DHEAD / 2));
+            p_rec + (long)vc * (DHEAD / 2));
+        #pragma unroll
+        for (int c = 0; c < VW4; ++c) vv[c] = __ldg(colv + c);
+        // mu slice for this lane (full-d field, 8-way split over rr, RNK-
+        // independent); d128 -> MUW == 4 -> one aligned uint4 per lane.
+        if constexpr (MUW % 4 == 0) {
+            const uint4* mup = reinterpret_cast<const uint4*>(
+                p_rec + RO_MU_L) + rr * (MUW / 4);
+            #pragma unroll
+            for (int j = 0; j < MUW / 4; ++j) {
+                const uint4 m4 = __ldg(mup + j);
+                mm[4 * j + 0] = m4.x; mm[4 * j + 1] = m4.y;
+                mm[4 * j + 2] = m4.z; mm[4 * j + 3] = m4.w;
+            }
+        } else {
+            const uint32_t* mup = reinterpret_cast<const uint32_t*>(
+                p_rec + RO_MU_L) + rr * MUW;
+            #pragma unroll
+            for (int j = 0; j < MUW; ++j) mm[j] = __ldg(mup + j);
+        }
+        // per-token coeff C[token, 0:RNK]: RNK contiguous bytes, read with an
+        // access width that divides the RNK-byte token stride (aligned for
+        // RNK in {2,4,8}), zero-padded to the uint2 the token sum consumes.
+        #pragma unroll
+        for (int tt = 0; tt < PGT / 8; ++tt) {
+            const uint8_t* pc = p_rec + RO_C8_L + (long)(rr + 8 * tt) * RNK;
+#if RNK == 8
+            cc[tt] = __ldg(reinterpret_cast<const uint2*>(pc));
+#elif RNK == 4
+            cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(pc));
+            cc[tt].y = 0u;
+#else
+            cc[tt].x = (unsigned)__ldg(
+                reinterpret_cast<const unsigned short*>(pc));
+            cc[tt].y = 0u;
+#endif
+            sc[tt] = *reinterpret_cast<const __nv_bfloat16*>(
+                p_rec + RO_CS_L + (long)(rr + 8 * tt) * 2);
+        }
+        sv  = *reinterpret_cast<const __nv_bfloat16*>(
+            p_rec + RO_VS_L + (long)vc * 2);
+        smu = *reinterpret_cast<const __nv_bfloat16*>(p_rec + RO_MUS_L);
+#else
+        // rank campaign v2: the six-slab reader is rank-parametric like the
+        // AOS one -- V/vs columns exist only for rr < RNK (clamp; score_tile
+        // zeroes qt for rr >= RNK), and the per-token coeff stride is RNK
+        // bytes (uint2 @r8, unsigned @r4, ushort @r2). RNK==8 compiles
+        // verbatim the original loads.
+        const int vcn = (rr < RNK) ? rr : (RNK - 1);
+        const uint4* colv = reinterpret_cast<const uint4*>(
+            v4 + (row * RNK + vcn) * (DHEAD / 2));
         #pragma unroll
         for (int c = 0; c < VW4; ++c) vv[c] = __ldg(colv + c);
         if constexpr (MUW % 4 == 0) {
@@ -507,12 +623,22 @@ void r8i4_score_kernel(
         }
         #pragma unroll
         for (int tt = 0; tt < PGT / 8; ++tt) {
-            cc[tt] = __ldg(reinterpret_cast<const uint2*>(
-                c8 + (row * PGT + rr + 8 * tt) * RNK));
+            const int8_t* pc = c8 + (long)(row * PGT + rr + 8 * tt) * RNK;
+#if RNK == 8
+            cc[tt] = __ldg(reinterpret_cast<const uint2*>(pc));
+#elif RNK == 4
+            cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(pc));
+            cc[tt].y = 0u;
+#else
+            cc[tt].x = (unsigned)__ldg(
+                reinterpret_cast<const unsigned short*>(pc));
+            cc[tt].y = 0u;
+#endif
             sc[tt] = cs[row * PGT + rr + 8 * tt];
         }
-        sv = vs[row * RNK + rr];
+        sv = vs[row * RNK + vcn];
         smu = mus[row];
+#endif
     };
     // Per-page scoring: bytes are loaded ONCE (the register bank) and swept
     // by the g-tile loop (4 heads per sweep; the G4 instantiation compiles
@@ -542,7 +668,15 @@ void r8i4_score_kernel(
                     acci = __dp4a((int)hi, (int)q8o[g][c * 4 + k], acci);
                 }
             }
-            const float qt = (float)acci * qsc[g] * __bfloat162float(sv);
+            // RNK<8: lanes rr >= RNK hold no basis column (load_page clamped
+            // their V/vs reads to a valid in-region column), so force their
+            // projection to exactly 0 -- the token sum over the octet then
+            // spans only the RNK live basis lanes, matching the oracle.  For
+            // RNK==8 (rr in [0,8)) the predicate is compile-time always-true
+            // -> folded away, r8 SASS verbatim.  Was AOS-only; now covers the
+            // rank-parametric six-slab lane too (rank campaign v2).
+            float qt = (rr < RNK) ? ((float)acci * qsc[g] * __bfloat162float(sv))
+                                  : 0.f;
             // ---- phase 1b: mu dot, MUW dp4a + 3 xor-shfl -------------- //
             int mui = 0;
             #pragma unroll
@@ -634,29 +768,42 @@ void r8i4_score_kernel(
         // derivation for the summary loads (block-table gather is not affine
         // in pp) but still gets the S-store + smem-pointer reduction.
         float* qtw = &qt_sh[warp][gidm][2 * t4m];
+        // ALLG: at the G4-template instantiation the b-octet heads (gl+4)
+        // do not exist -- their qsc/q8d rows are uninitialized and their S
+        // rows belong to the NEXT kv-head. BOFF=0 aliases the b-side decls
+        // onto the (live) a-side so every read is safe; the b tile calls are
+        // compile-time elided below. G8: BOFF=4 reproduces the source
+        // verbatim -> flagship SASS unchanged.
+        constexpr int BOFF = G8 ? 4 : 0;
         const float* qt_a = &qt_sh[warp][gl][0];
-        const float* qt_b = &qt_sh[warp][gl + 4][0];
+        const float* qt_b = &qt_sh[warp][gl + BOFF][0];
         const uint32_t* q8d_a = &q8d[gl][rr * MUW];
-        const uint32_t* q8d_b = &q8d[gl + 4][rr * MUW];
+        const uint32_t* q8d_b = &q8d[gl + BOFF][rr * MUW];
         const float qsc_m = qsc[gidm];
-        const float qsc_a = qsc[gl], qsc_b = qsc[gl + 4];
+        const float qsc_a = qsc[gl], qsc_b = qsc[gl + BOFF];
 #ifdef R8I4_MMA_FLAT
         // FLAT (doc 18): per-head shift constants for the mass exps.
-        const float K_a = Kflat[kh * G + gl], K_b = Kflat[kh * G + gl + 4];
+        // (BOFF clamps the b-read at the G4-template; b is elided there.)
+        const float K_a = Kflat[kh * G + gl], K_b = Kflat[kh * G + gl + BOFF];
 #else
         constexpr float K_a = 0.f, K_b = 0.f;
 #endif
         float* Sp_a = S + ((((long)r * n_kv + kh) * G + gl) * MP) + wid;
-        float* Sp_b = Sp_a + 4L * MP;
+        float* Sp_b = Sp_a + (long)BOFF * MP;
         const long row0 = BT ? 0L : (pb_v + wid);
         const uint4* p_mu = reinterpret_cast<const uint4*>(
             mu8 + row0 * DHEAD) + rr * (MUW / 4);
         const int8_t* p_c8 = c8 + (row0 * PGT + rr) * RNK;
         const __nv_bfloat16* p_cs = cs + row0 * PGT + rr;
         const __nv_bfloat16* p_mus = mus + row0;
+        // rank v2: basis columns exist only for index < RNK -- clamp the dead
+        // lanes' pointers in-bounds (their mma output cols are gated to 0 by
+        // the #if RNK==8/#else epilogues). RNK==8: clamps fold, verbatim SASS.
+        const int gvc = (gidm < RNK) ? gidm : (RNK - 1);
+        const int svc = (2 * t4m < RNK) ? 2 * t4m : (RNK - 2 < 0 ? 0 : RNK - 2);
         const unsigned* p_v4 = reinterpret_cast<const unsigned*>(
-            v4 + (row0 * RNK + gidm) * (DHEAD / 2)) + t4m;
-        const __nv_bfloat16* p_vs = vs + row0 * RNK + 2 * t4m;
+            v4 + (row0 * RNK + gvc) * (DHEAD / 2)) + t4m;
+        const __nv_bfloat16* p_vs = vs + row0 * RNK + svc;
         // tile: byte-identical arithmetic and op order to the shipped tile(g)
         // lambda below; only the qt/q8d/qsc/S accesses go through hoisted
         // per-lane pointers (same addresses, same values).
@@ -962,7 +1109,7 @@ void r8i4_score_kernel(
             // NOT score_h semantics -- never gate, never ship; the probe
             // prices stage-1 of the proposed split (doc sec 17).
             Sp_a[0] = (float)c0;
-            Sp_b[0] = (float)c1;
+            if constexpr (G8) Sp_b[0] = (float)c1;   // ALLG G4: no b rows
             (void)qsc_m;
             issue_rec(pp + 2 * nworker, pslot);
 #else
@@ -980,10 +1127,12 @@ void r8i4_score_kernel(
             __syncwarp();
 #ifdef R8I4_MMA_FOLDR
             fold_a = fmaxf(fold_a, tile(qt_a, q8d_a, qsc_a, Sp_a, K_a));
-            fold_b = fmaxf(fold_b, tile(qt_b, q8d_b, qsc_b, Sp_b, K_b));
+            if constexpr (G8)
+                fold_b = fmaxf(fold_b, tile(qt_b, q8d_b, qsc_b, Sp_b, K_b));
 #else
             tile(qt_a, q8d_a, qsc_a, Sp_a, K_a);
-            tile(qt_b, q8d_b, qsc_b, Sp_b, K_b);
+            if constexpr (G8)          // ALLG G4: b-octet heads do not exist
+                tile(qt_b, q8d_b, qsc_b, Sp_b, K_b);
 #endif
             issue_rec(pp + 2 * nworker, pslot);
 #endif  // R8I4_MMA_S1PROBE
@@ -1106,10 +1255,12 @@ void r8i4_score_kernel(
             // (3) tiles (identical)
 #ifdef R8I4_MMA_FOLDR
             fold_a = fmaxf(fold_a, tile(qt_a, q8d_a, qsc_a, Sp_a, K_a));
-            fold_b = fmaxf(fold_b, tile(qt_b, q8d_b, qsc_b, Sp_b, K_b));
+            if constexpr (G8)
+                fold_b = fmaxf(fold_b, tile(qt_b, q8d_b, qsc_b, Sp_b, K_b));
 #else
             tile(qt_a, q8d_a, qsc_a, Sp_a, K_a);
-            tile(qt_b, q8d_b, qsc_b, Sp_b, K_b);
+            if constexpr (G8)          // ALLG G4: b-octet heads do not exist
+                tile(qt_b, q8d_b, qsc_b, Sp_b, K_b);
 #endif
             if constexpr (!BT) p_rec += (long)nworker * RECB;
             Sp_a += nworker; Sp_b += nworker;
@@ -1153,7 +1304,8 @@ void r8i4_score_kernel(
             long cur_row = (wid < P) ? row_of(wid) : 0L;
             if (wid < P) {
                 const unsigned* pf = reinterpret_cast<const unsigned*>(
-                    v4 + (cur_row * RNK + gidm) * (DHEAD / 2)) + t4m;
+                    v4 + (cur_row * RNK + ((gidm < RNK) ? gidm : (RNK - 1)))
+                        * (DHEAD / 2)) + t4m;  // rank v2 clamp
                 nv0 = __ldg(pf);      nv1 = __ldg(pf + 4);
                 nv2 = __ldg(pf + 8);  nv3 = __ldg(pf + 12);
             }
@@ -1177,7 +1329,7 @@ void r8i4_score_kernel(
                 p_c8 = c8 + (row * PGT + rr) * RNK;
                 p_cs = cs + row * PGT + rr;
                 p_mus = mus + row;
-                p_vs = vs + row * RNK + 2 * t4m;
+                p_vs = vs + row * RNK + svc;               // rank v2 clamp
                 // (1) per-(lane=rr) mu / C / cs / mus loads (same addresses)
                 #pragma unroll
                 for (int j = 0; j < MUW / 4; ++j) {
@@ -1186,8 +1338,18 @@ void r8i4_score_kernel(
                 }
                 #pragma unroll
                 for (int tt = 0; tt < PGT / 8; ++tt) {
+#if RNK == 8
                     cc[tt] = __ldg(reinterpret_cast<const uint2*>(
                         p_c8 + (8 * tt) * RNK));
+#elif RNK == 4
+                    cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
+                        p_c8 + (8 * tt) * RNK));
+                    cc[tt].y = 0u;
+#else
+                    cc[tt].x = (unsigned)__ldg(reinterpret_cast<
+                        const unsigned short*>(p_c8 + (8 * tt) * RNK));
+                    cc[tt].y = 0u;
+#endif
                     sc[tt] = p_cs[8 * tt];
                 }
                 smu = *p_mus;
@@ -1203,7 +1365,8 @@ void r8i4_score_kernel(
 #ifdef LOCKS_FIX1_CARRYROW
                     cur_row = row_of(ppn);     // the ONE bt gather this iteration
                     const unsigned* pf = reinterpret_cast<const unsigned*>(
-                        v4 + (cur_row * RNK + gidm) * (DHEAD / 2)) + t4m;
+                        v4 + (cur_row * RNK + ((gidm < RNK) ? gidm : (RNK - 1)))
+                        * (DHEAD / 2)) + t4m;  // rank v2 clamp
 #else
                     const long rown = row_of(ppn);
                     const unsigned* pf = reinterpret_cast<const unsigned*>(
@@ -1312,8 +1475,8 @@ void r8i4_score_kernel(
                 p_cs = cs + row * PGT + rr;
                 p_mus = mus + row;
                 p_v4 = reinterpret_cast<const unsigned*>(
-                    v4 + (row * RNK + gidm) * (DHEAD / 2)) + t4m;
-                p_vs = vs + row * RNK + 2 * t4m;
+                    v4 + (row * RNK + gvc) * (DHEAD / 2)) + t4m;   // rank v2 clamp
+                p_vs = vs + row * RNK + svc;
             }
             // (1) per-(lane=rr) mu / C / cs / mus loads (same addresses)
             #pragma unroll
@@ -1323,8 +1486,18 @@ void r8i4_score_kernel(
             }
             #pragma unroll
             for (int tt = 0; tt < PGT / 8; ++tt) {
+#if RNK == 8
                 cc[tt] = __ldg(reinterpret_cast<const uint2*>(
                     p_c8 + (8 * tt) * RNK));
+#elif RNK == 4
+                cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
+                    p_c8 + (8 * tt) * RNK));
+                cc[tt].y = 0u;
+#else
+                cc[tt].x = (unsigned)__ldg(reinterpret_cast<
+                    const unsigned short*>(p_c8 + (8 * tt) * RNK));
+                cc[tt].y = 0u;
+#endif
                 sc[tt] = p_cs[8 * tt];
             }
             smu = *p_mus;
@@ -1424,14 +1597,27 @@ void r8i4_score_kernel(
             }
             #pragma unroll
             for (int tt = 0; tt < PGT / 8; ++tt) {
+#if RNK == 8
                 cc[tt] = __ldg(reinterpret_cast<const uint2*>(
                     c8 + (row * PGT + rr + 8 * tt) * RNK));
+#elif RNK == 4
+                cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
+                    c8 + (row * PGT + rr + 8 * tt) * RNK));
+                cc[tt].y = 0u;
+#else
+                cc[tt].x = (unsigned)__ldg(reinterpret_cast<const unsigned short*>(
+                    c8 + (row * PGT + rr + 8 * tt) * RNK));
+                cc[tt].y = 0u;
+#endif
                 sc[tt] = cs[row * PGT + rr + 8 * tt];
             }
             smu = mus[row];
             // (2) mma projection: qt[head][basis] for all 8x8 -> qt_sh
+            // (rank v2: dead basis cols gidm >= RNK clamp in-bounds; their
+            // mma output cols are zero-gated in the epilogue)
             const unsigned* cwp = reinterpret_cast<const unsigned*>(
-                v4 + (row * RNK + gidm) * (DHEAD / 2));   // basis column gidm
+                v4 + (row * RNK + ((gidm < RNK) ? gidm : (RNK - 1)))
+                     * (DHEAD / 2));                       // basis column gidm
             const unsigned cw0 = __ldg(cwp + t4m),      cw1 = __ldg(cwp + 4 + t4m),
                            cw2 = __ldg(cwp + 8 + t4m),  cw3 = __ldg(cwp + 12 + t4m);
 #ifdef R8I4_MMA_MUC
@@ -1493,7 +1679,8 @@ void r8i4_score_kernel(
 #endif
             // c0/c1 = qt raw for head=gidm, basis {2*t4m, 2*t4m+1}
             const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(
-                vs + row * RNK + 2 * t4m);
+                vs + row * RNK + ((2 * t4m < RNK) ? 2 * t4m
+                 : (RNK - 2 < 0 ? 0 : RNK - 2)));  // rank v2 clamp
             const float qscg = qsc[gidm];
             qt_sh[warp][gidm][2*t4m]     = (float)c0 * qscg
                                           * __bfloat162float(sv2.x);
@@ -1837,11 +2024,11 @@ void r8score_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor S,
                 "rec must be contiguous (n_kv, P, 832) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(0) == R && S.size(1) == n_kv && S.size(3) == P, "S");
-    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128 && G == 8
-                && g8_enabled(),
-                "r8score_aos covers the G8 d128 p16 flagship only");
+    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
+                && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
+                "r8score_aos covers the G in {4,8} d128 p16 records only");
     TORCH_CHECK(zsplit >= 1 && zsplit <= 65535, "zsplit range");
-    KFn kfn = pick_kernel(16, 128, /*bt=*/false, /*g4=*/false, /*g8=*/true);
+    KFn kfn = pick_kernel(16, 128, /*bt=*/false, /*g4=*/(G <= 4), /*g8=*/(G == 8));
     dim3 grid((unsigned)R, (unsigned)n_kv, (unsigned)zsplit);
     kfn<<<grid, TB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
@@ -1880,9 +2067,9 @@ void r8i4_score_bt_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor bt,
                 "rec must be contiguous (NB, n_kv, 832) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
-    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128 && G == 8
-                && g8_enabled(),
-                "r8i4_score_bt_aos covers the G8 d128 p16 flagship only");
+    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
+                && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
+                "r8i4_score_bt_aos covers G in {4,8} d128 p16 records only");
     TORCH_CHECK(bt.scalar_type() == torch::kInt && bt.stride(1) == 1,
                 "block table must be int32, row-contiguous");
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(),
@@ -1891,7 +2078,7 @@ void r8i4_score_bt_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor bt,
                 && n_req <= nsh.size(0) && n_req <= q.size(0),
                 "n_req out of range");
     TORCH_CHECK(zsplit >= 1 && zsplit <= 65535, "zsplit range");
-    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/false, /*g8=*/true);
+    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/(G <= 4), /*g8=*/(G == 8));
     dim3 grid((unsigned)n_req, (unsigned)n_kv, (unsigned)zsplit);
     kfn<<<grid, TB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
@@ -1932,9 +2119,9 @@ void r8i4_score_bt_aos_fold(torch::Tensor q, torch::Tensor rec,
                 "rec must be contiguous (NB, n_kv, RECB) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
-    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128 && G == 8
-                && g8_enabled(),
-                "r8i4_score_bt_aos_fold covers the G8 d128 p16 flagship only");
+    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
+                && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
+                "r8i4_score_bt_aos_fold covers G in {4,8} d128 p16 records only");
     TORCH_CHECK(bt.scalar_type() == torch::kInt && bt.stride(1) == 1,
                 "block table must be int32, row-contiguous");
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(),
@@ -1949,7 +2136,7 @@ void r8i4_score_bt_aos_fold(torch::Tensor q, torch::Tensor rec,
     TORCH_CHECK(ghist.scalar_type() == torch::kInt
                 && ghist.numel() >= (long)n_req * n_kv * 256,
                 "ghist scratch too small");
-    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/false, /*g8=*/true);
+    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/(G <= 4), /*g8=*/(G == 8));
     dim3 grid((unsigned)n_req, (unsigned)n_kv, (unsigned)zsplit);
     kfn<<<grid, TB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
@@ -1989,9 +2176,9 @@ void r8i4_score_bt_aos_flat(torch::Tensor q, torch::Tensor rec,
                 "rec must be contiguous (NB, n_kv, RECB) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
-    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128 && G == 8
-                && g8_enabled(),
-                "r8i4_score_bt_aos_flat covers the G8 d128 p16 flagship only");
+    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
+                && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
+                "r8i4_score_bt_aos_flat covers G in {4,8} d128 p16 records only");
     TORCH_CHECK(bt.scalar_type() == torch::kInt && bt.stride(1) == 1,
                 "block table must be int32, row-contiguous");
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(),
@@ -2003,7 +2190,7 @@ void r8i4_score_bt_aos_flat(torch::Tensor q, torch::Tensor rec,
                 && n_req <= nsh.size(0) && n_req <= q.size(0),
                 "n_req out of range");
     TORCH_CHECK(zsplit >= 1 && zsplit <= 65535, "zsplit range");
-    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/false, /*g8=*/true);
+    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/(G <= 4), /*g8=*/(G == 8));
     dim3 grid((unsigned)n_req, (unsigned)n_kv, (unsigned)zsplit);
     kfn<<<grid, TB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
@@ -2045,8 +2232,9 @@ void r8i4_score_bt_aos_flat_fold(torch::Tensor q, torch::Tensor rec,
                 && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST, "rec");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
-    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128 && G == 8
-                && g8_enabled(), "flat_fold covers the G8 d128 p16 flagship");
+    TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
+                && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
+                "flat_fold covers G in {4,8} d128 p16 records");
     TORCH_CHECK(Kflat.is_contiguous() && Kflat.scalar_type() == torch::kFloat
                 && Kflat.numel() == (long)n_kv * G, "Kflat (n_kv*G) fp32");
     TORCH_CHECK(gpmax.scalar_type() == torch::kFloat
@@ -2059,7 +2247,7 @@ void r8i4_score_bt_aos_flat_fold(torch::Tensor q, torch::Tensor rec,
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(), "nsh");
     TORCH_CHECK(n_req >= 1 && n_req <= S.size(0) && zsplit >= 1
                 && zsplit <= 65535, "shape");
-    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/false, /*g8=*/true);
+    KFn kfn = pick_kernel(16, 128, /*bt=*/true, /*g4=*/(G <= 4), /*g8=*/(G == 8));
     dim3 grid((unsigned)n_req, (unsigned)n_kv, (unsigned)zsplit);
     kfn<<<grid, TB, 0, at::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
@@ -2590,6 +2778,15 @@ def _hmax_buf(st):
 def _get(verbose: bool = False):
     global _MOD
     if _MOD is None:
+        # i-axis guard (knob contract P2): this TU's V unpack is int4-
+        # hardcoded (nibble PRMT path). A non-i4 config must never reach a
+        # CUDA build -- loud here, no fallback; the sm_120 torch twin and
+        # the P4 i-axis template cases are the only other lanes.
+        from .r8i4_state import IBITS as _ibits
+        assert _ibits == 4, (
+            f"locks r8i4 CUDA score TU is int4-only, LOCKS_R8I4_IBITS="
+            f"{_ibits}: the i-axis CUDA case is deferred (P4); non-i4 runs "
+            "the sm_120 torch twin lane only")
         from torch.utils.cpp_extension import load_inline
         import os as _os
         _cf = ["-O3", "--use_fast_math", _arch.arch_flag()]
@@ -2627,13 +2824,20 @@ def _get(verbose: bool = False):
         if _os.environ.get("LOCKS_FIX1_AF_HOIST"): _cf += ["-DLOCKS_FIX1_AF_HOIST"]
         if _os.environ.get("LOCKS_FIX1_CARRYROW"): _cf += ["-DLOCKS_FIX1_CARRYROW"]
         if _os.environ.get("R8I4_MMA_AOS"): _cf += ["-DR8I4_MMA_AOS"]
+        if _os.environ.get("R8I4_MMA_ALLG"):
+            # ALLG (rank campaign v2): tensor-core projection for G4 models.
+            # Requires the AOS build; excludes MUC (kernel #errors enforce).
+            _cf += ["-DR8I4_MMA_ALLG"]
         if _os.environ.get("R8I4_MMA_PFR"): _cf += ["-DR8I4_MMA_PFR"]
         if _os.environ.get("R8I4_MMA_S1PROBE"): _cf += ["-DR8I4_MMA_S1PROBE"]
         if _os.environ.get("R8I4_MMA_FLAT"): _cf += ["-DR8I4_MMA_FLAT"]
         if _os.environ.get("R8I4_CP_NOEXP"): _cf += ["-DR8I4_CP_NOEXP"]
         if _os.environ.get("R8I4_CP_NODT"): _cf += ["-DR8I4_CP_NODT"]
         from .r8i4_state import MUC as _muc
-        if _muc: _cf += ["-DR8I4_MMA_MUC"]
+        # rank v2: MUC is AOS-only (kernel #error enforces AOS+BIAS);
+        # never emit the define on a six-slab build.
+        if _muc and _os.environ.get("R8I4_MMA_AOS"):
+            _cf += ["-DR8I4_MMA_MUC"]
         if _os.environ.get("LOCKS_SCREEN"): _cf += ["-DR8I4_MMA_SCREEN"]
         if _os.environ.get("LOCKS_PMAX_FOLDR"): _cf += ["-DR8I4_MMA_FOLDR"]
         # Removed opt-in arms (2026-07-21 cleanup, Wave 3a; each REFUTED with
@@ -2797,7 +3001,16 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
     # (LOCKS_FUSE_NRMTOPB=0 / LOCKS_TOPB_TRITON=1); decode on Triton
     # (LOCKS_DECODE_TRITON=1).
     from .. import arch as _arch
-    if _arch.is_blackwell_sm120():
+    # LOCKS_FORCE_SCORE_TORCH=1: EXPLICIT opt-in to the plain-torch score twin
+    # on ANY arch (not a silent fallback -- loud one-shot log below, same
+    # discipline as the sm_120 gate).  Its one use is page-geometry validation
+    # on Hopper: the deployed hand-CUDA scorer is page {16,32}-only, so page 64
+    # (an appendix ps-knob study) would TORCH_CHECK-abort in the CUDA launch;
+    # the torch twin is page-parametric and byte-faithful to the G1 torch
+    # reference, so it yields the SAME score_h (hence page rankings) that the
+    # sm_120 b40x4 lane already produces for page 64.  NOT a deployment path.
+    _force_torch = os.environ.get("LOCKS_FORCE_SCORE_TORCH", "0") == "1"
+    if _arch.is_blackwell_sm120() or _force_torch:
         # EXPLICIT arch dispatch, now also LOUD (no-fallback rule,
         # 2026-07-22): this is a DIFFERENT implementation (plain torch, not
         # the hand-CUDA scorer) and a different performance class, so a
@@ -2808,9 +3021,13 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
         global _SM120_SAID
         if not _SM120_SAID:
             _SM120_SAID = True
-            print("[locks] FALLBACK r8i4 score: sm_120 (Blackwell) -- the "
-                  "hand-CUDA scorer lane was removed; running the plain-torch "
-                  "twin (score_h identical, NOT the deployed kernel path)",
+            _why = ("sm_120 (Blackwell)" if _arch.is_blackwell_sm120()
+                    else "LOCKS_FORCE_SCORE_TORCH=1 (page-geometry validation "
+                         "lane -- e.g. page 64 on Hopper, which the {16,32}-"
+                         "only hand-CUDA scorer rejects)")
+            print(f"[locks] FALLBACK r8i4 score: {_why} -- the hand-CUDA "
+                  "scorer lane is skipped; running the plain-torch twin "
+                  "(score_h identical, NOT the deployed kernel path)",
                   flush=True)
         from . import r8i4_score_torch as _r8t
         _r8t.r8i4_score_torch(st, layer, q, block_table, seq_lens, n_req, scale)
@@ -2909,10 +3126,11 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
                                      st.n_sel_hi, st.score_h, float(scale),
                                      int(z), int(n_req))
     else:
-        from .r8i4_state import RNK as _rnk
-        assert _rnk == 8, \
-            "rank campaign v1: RNK<8 covers the MMA+AOS entries only -- " \
-            "set R8I4_MMA_AOS=1 (the six-slab kernel keeps rank-8 layout)"
+        # rank v2 (2026-07-27): the six-slab lane is rank-parametric (RNK-width
+        # coeff loads + clamped dead-column reads + the pre-existing epilogue
+        # gating), so RNK<8 rides the FULL flagship lane set here -- the v1
+        # "AOS entries only" assert is retired (user ruling: r4/r2 must never
+        # be worse than r8 at any context).
         v4, vs, c8, cs, mu8, mus, _tag = st.layer_state(layer)
         # ``st._q_preroped`` (set by the attention impl before EVERY select, and
         # by the co op's own absorbed branches): the rope-absorbing lanes do not

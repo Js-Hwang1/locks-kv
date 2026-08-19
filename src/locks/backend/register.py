@@ -87,7 +87,37 @@ def _summary_head_size(cfg, block_size: int, head_size: int = 128) -> int:
 
 _FA_PATH = "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"
 _OUR_PATH = f"{__name__}.LocksAttentionBackend"
+# MLA (DeepSeek V2/V3/V3.2): vLLM resolves an MLA backend (path contains
+# ".mla.") for latent archs (num_key_value_heads==1 + kv_lora_rank). We swap it
+# for the LOCKS MLA impl -- the SAME seam vLLM uses to separate MLA from GQA.
+_MLA_PATH = __name__.rsplit(".", 1)[0] + ".mla_attn.LocksMLABackend"
 _ANNOUNCED = False
+_ANNOUNCED_MLA = False
+
+
+def _neuter_dsa_indexer() -> None:
+    """No-op DeepSeek-V3.2's DSA lightning indexer (LOCKS ignores it). Its
+    ``forward`` normally ends in ``self.indexer_op(...)`` which writes the shared
+    topk buffer (that LOCKS never reads) and runs ``fp8_fp4_mqa_logits`` -- the
+    per-step allocation that OOMs at mns>1 and a large wasted-compute tax. We
+    replace ``Indexer.forward`` with a no-op; the caller discards its return."""
+    try:
+        from vllm.model_executor.models import deepseek_v2 as _dsv2
+    except Exception as exc:                                # pragma: no cover
+        print(f"[locks] DSA-indexer neuter SKIPPED ({exc})", flush=True)
+        return
+    Indexer = getattr(_dsv2, "Indexer", None)
+    if Indexer is None or getattr(Indexer.forward, "_locks_neutered", False):
+        return
+
+    def forward(self, *args, **kwargs):
+        return None
+
+    forward._locks_neutered = True
+    Indexer.forward = forward
+    print("[locks] DSA indexer NEUTERED (no-op forward; LOCKS does its own "
+          "selection) -- frees the per-step fp8_fp4_mqa_logits alloc + compute",
+          flush=True)
 
 
 def register(overrides: dict | None = None) -> None:
@@ -108,6 +138,14 @@ def register(overrides: dict | None = None) -> None:
     cfg = LocksConfig.load(overrides)
     _runtime.set_config(cfg)
 
+    # DeepSeek-V3.2 (DSA): LOCKS does its OWN page selection and IGNORES the
+    # trained lightning indexer. Left running, the indexer executes every decode
+    # step (fp8_fp4_mqa_logits over the full context) -- pure wasted compute AND
+    # a ~520MB/step allocation that OOMs at mns>1 (measured h200x8, 2026-07-26).
+    # No-op its forward so LOCKS pays only for its own selection + attention.
+    # Harmless on V2/V3 (no Indexer class instances).
+    _neuter_dsa_indexer()
+
     from vllm.platforms import cuda
     # 0.24: get_attn_backend_cls is defined on CudaPlatformBase (CudaPlatform is
     # the Nvml/NonNvml alias). Patch the class in the MRO that defines it.
@@ -117,7 +155,7 @@ def register(overrides: dict | None = None) -> None:
 
     def get_attn_backend_cls(cls, *args, **kwargs):
         path = orig(cls, *args, **kwargs)
-        if path == _FA_PATH:
+        if path == _FA_PATH:                          # GQA -- unchanged
             global _ANNOUNCED
             if not _ANNOUNCED:
                 _ANNOUNCED = True
@@ -126,6 +164,17 @@ def register(overrides: dict | None = None) -> None:
                       f"sink={cfg.sink_pages} window={cfg.window_pages} "
                       f"-> {_OUR_PATH}", flush=True)
             return _OUR_PATH
+        if isinstance(path, str) and ".mla." in path and path != _MLA_PATH:
+            # MLA (DeepSeek). The mem tier + adaptive coverage are GQA-only; the
+            # MLA impl requires a fixed page budget (asserted at first decode).
+            global _ANNOUNCED_MLA
+            if not _ANNOUNCED_MLA:
+                _ANNOUNCED_MLA = True
+                print(f"[locks] ACTIVE (MLA) variant={cfg.variant} "
+                      f"budget={cfg.budget} budget_pages={cfg.budget_pages} "
+                      f"sink={cfg.sink_pages} window={cfg.window_pages} "
+                      f"{path} -> {_MLA_PATH}", flush=True)
+            return _MLA_PATH
         return path
 
     target.get_attn_backend_cls = classmethod(get_attn_backend_cls)

@@ -20,9 +20,10 @@ gate), INCLUDING the per-(kv-head, group) int8 round-trip of q the kernel does
     score_h[h,g,p] = logsumexp_t tok[h,g,t]                    (Cref=c8*cs, muref=mu8*mus)
 
 with ``qref = round(q/qs)*qs``, ``qs = |q|.amax(-1)/127`` per (h,g).
-The int4 basis is unpacked column-major (lo nibble = even-d row, hi = odd-d),
-4-bit two's-complement sign-extended ``((n^8)-8)`` -- exactly ``_write_post``'s
-packing in reverse. Pure torch (einsum/logsumexp), no CUDA/Triton.
+The IBITS-bit basis (LOCKS_R8I4_IBITS; i4 default) is unpacked column-major
+via ``_unpack_ibit`` (i4: lo nibble = even-d row, hi = odd-d, two's-complement
+``((n^8)-8)``) -- exactly ``_write_post``'s ``_pack_ibit`` in reverse.
+Pure torch (einsum/logsumexp), no CUDA/Triton.
 """
 from __future__ import annotations
 
@@ -30,9 +31,28 @@ import os as _os
 
 import torch
 
+from .r8i4_state import IBITS
+
 _ANNOUNCED = False
 _SCORE_MS = 0.0   # LOCKS_R8I4_TIME=1 profiling accumulators (GPU-event ms)
 _SCORE_N = 0
+
+
+def _unpack_ibit(vb: torch.Tensor, d: int) -> torch.Tensor:
+    """Sign-extend packed IBITS-bit V bytes (..., d*IBITS//8) int16 -> fp32
+    (..., d): field k of each byte -> d row k::PPB, PPB = 8//IBITS, via the
+    i-bit two's-complement extension ((n ^ 2^(i-1)) - 2^(i-1)). IBITS=4 is
+    op-for-op the shipped lo/hi nibble unpack (bitwise regression anchor);
+    IBITS=8 reduces to the native int8 sign-extension (one full-byte field);
+    IBITS=2 walks four 2-bit fields."""
+    ppb = 8 // IBITS
+    mask = (1 << IBITS) - 1
+    sgn = 1 << (IBITS - 1)
+    out = torch.empty(*vb.shape[:-1], d, device=vb.device, dtype=torch.float32)
+    for k in range(ppb):
+        out[..., k::ppb] = (
+            (((vb >> (k * IBITS)) & mask) ^ sgn) - sgn).float()
+    return out
 
 
 @torch.no_grad()
@@ -119,18 +139,14 @@ def _r8i4_score_torch_fp32(st, layer, q, block_table, n_req, scale, page_chunk,
     for c0 in range(0, max_hi, chunk):
         c1 = min(c0 + chunk, max_hi)
         blk = bt_all[:, c0:c1]                            # (R, P)
-        v4b = v4[blk].to(torch.int16)                     # (R, P, n_kv, RNK, d//2)
+        v4b = v4[blk].to(torch.int16)                # (R, P, n_kv, RNK, d*i//8)
         vsb = vs[blk].float()                             # (R, P, n_kv, RNK)
         Cref = c8[blk].float() * cs[blk].float()[..., None]     # (R,P,n_kv,page,RNK)
         muref = mu8[blk].float() * mus[blk].float()[..., None]  # (R,P,n_kv,d)
         R, P = int(blk.shape[0]), int(blk.shape[1])
-        # unpack int4 column-major: lo nibble -> even-d row, hi -> odd-d row;
-        # 4-bit two's-complement sign-extend ((n^8)-8).
-        lo = ((v4b & 0xF) ^ 8) - 8                        # (R,P,n_kv,RNK,d//2)
-        hn = (((v4b >> 4) & 0xF) ^ 8) - 8
-        Vq = torch.empty(R, P, n_kv, RNK, d, device=v4b.device, dtype=torch.float32)
-        Vq[..., 0::2] = lo.float()
-        Vq[..., 1::2] = hn.float()
+        # unpack the IBITS-bit column-major basis (i4: lo nibble -> even-d
+        # row, hi -> odd-d, the shipped path; see _unpack_ibit).
+        Vq = _unpack_ibit(v4b, d)                         # (R,P,n_kv,RNK,d)
         Vref = (Vq * vsb[..., None]).transpose(-1, -2)             # (R,P,n_kv,d,RNK)
         qt = torch.einsum("rpkdn,rkgd->rpkgn", Vref, qref)         # (R,P,n_kv,G,RNK)
         tok = torch.einsum("rpktn,rpkgn->rpkgt", Cref, qt)         # (R,P,n_kv,G,page)

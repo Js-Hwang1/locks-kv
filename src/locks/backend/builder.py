@@ -701,7 +701,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             # ONE summary state: r8i4 (the quad / clse / r8 variants were
             # deleted 2026-07-22).
             from ..selection import R8i4State as _State
-            from ..selection.r8i4_state import RNK as rank  # LOCKS_R8I4_RANK (2|4|8)
+            from ..selection.r8i4_state import RNK as rank  # LOCKS_R8I4_RANK (1 <= r < page)
             n_kv = self.num_heads_kv
             G = self.num_heads_q // n_kv
             max_reqs = self._vllm_config.scheduler_config.max_num_seqs
@@ -742,6 +742,16 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 self._layer_k = None
             else:
                 self._layer_k = [_split_kv(kvc)[0] for kvc in layer_kv]
+            # KV-QUANT STUDY (locks.quant, LOCKS_KVQ): stash the engine (K, V)
+            # half views so the r8i4 build hook can fake-quant finalized pages
+            # in place (stage pre/post).  Inert when LOCKS_KVQ is unset/off.
+            from .. import quant as _kvq
+            if _kvq.KVQ is not None:
+                _kvq.check_compat(cfg)
+                st._kvq_layers = [_split_kv(kvc) for kvc in layer_kv]
+                print(f"[locks] KVQ ARMED: {_kvq.KVQ.describe()} "
+                      f"(engine K/V views stashed, {len(layer_kv)} layers)",
+                      flush=True)
             self._state = st
             if not getattr(cfg, "mem_summary_cache", False):
                 self._ensure_overlap(sfc)

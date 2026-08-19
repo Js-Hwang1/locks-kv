@@ -4,9 +4,10 @@ The r8i4 score mode (ours_doc/R8I4_KERNELS.md; ours_doc/PAPER_R8I4.md section
 4) stores, per (page, kv-head), the rank-8 page-projection summary in the
 PACKED layout the S4 register-pipelined CUDA kernel streams directly:
 
-  pp_v4  (L, NB, n_kv, 8, d/2)   uint8  int4 basis V, COLUMN-major packed
-                                        (basis column rr = 64 contiguous bytes,
-                                        lo nibble = even d row), per-column
+  pp_v4  (L, NB, n_kv, RNK, d*i/8) uint8  IBITS-bit basis V, COLUMN-major
+                                        packed at 8//i values/byte (i4
+                                        default: d/2 bytes/column, lo nibble
+                                        = even d row), per-column
   pp_vs  (L, NB, n_kv, 8)        bf16   scales (absmax/7)
   pp_c8  (L, NB, n_kv, page, 8)  int8   coeffs C = U8*S8, per-token
   pp_cs  (L, NB, n_kv, page)     bf16   scales (absmax/127)
@@ -14,10 +15,11 @@ PACKED layout the S4 register-pipelined CUDA kernel streams directly:
   pp_mus (L, NB, n_kv)           bf16   scale (absmax/127)
   pp_tag (L, NB, n_kv, TAGW)     bf16   content-tag invalidation, NaN-init
 
-Footprint per (page, kv-head): 4d (v4) + 16 (vs) + 8*page (c8) + 2*page (cs)
-+ d (mu8) + 2 (mus) = 5d + 10*page + 18 B; at the d=128 flagship that is
-818 B at page 16 (~9.4% of the 8 KB bf16 K+V page) / 978 B at page 32
-(~6.0%), plus the 16 B tag.
+Footprint per (page, kv-head) at the r8/i4 flagship: 4d (v4) + 16 (vs) +
+8*page (c8) + 2*page (cs) + d (mu8) + 2 (mus) = 5d + 10*page + 18 B; at the
+d=128 flagship that is 818 B at page 16 (~9.4% of the 8 KB bf16 K+V page) /
+978 B at page 32 (~6.0%), plus the 16 B tag. In general only the V term
+moves with the (r, i) knobs: RNK*d*i/8 B (record_bytes is authoritative).
 
 R8i4State MIRRORS :class:`R8State` (alloc-once / graph-safe / physical-block
 keyed, one L-major slab per layer).  The per-step outputs / scratch (score,
@@ -28,11 +30,14 @@ unchanged.  The score kernel writes the PER-HEAD page LSE into ``score_h``
 and the GQA combine (``_nrm_launch`` | group max) reduces it into ``score``
 exactly where the quad/clse path does it.
 
-Kernel geometry contract (r8i4_score_cuda supported set): d in {64, 128, 256}
-(template instantiations), page in {16, 32}, G <= 8 (the fused nrm+topb
-selector's asserted bound -- the score kernel's g-tile loop would take G <= 16
-but the only combine path does not), rank 8 (the packed layout).  n_kv, G, d
-and page are READ
+Kernel geometry contract: d in {64, 128, 256} (template instantiations),
+page in {16, 32, 64} (multiple-of-16 only -- vLLM FlashAttention requires it;
+64 = six-slab lane only, the Hopper CUDA score/decode kernels and the AOS
+record stay {16, 32}), G <= 8 (the fused
+nrm+topb selector's asserted bound -- the score kernel's g-tile loop would
+take G <= 16 but the only combine path does not), rank any integer in
+[1, page-1] (knob contract; the Hopper CUDA kernel stays {2, 4, 8} via its
+own #error).  n_kv, G, d and page are READ
 from the engine geometry by the builder; the supported SET is asserted HERE,
 at wiring time, so an unsupported model fails loudly at state alloc rather
 than inside a kernel.
@@ -45,18 +50,45 @@ import torch
 
 TAGW = 8   # bf16 leading key channels of the page-final token = content tag
 
-# Summary rank knob (USER DIRECTIVE 2026-07-17, doc 19): r2/r4/r8 share one
+# Summary rank knob (USER DIRECTIVE 2026-07-17, doc 19): all ranks share one
 # build (top-RNK of the SAME page-gram eigh) and one kernel family. Env so
 # the module constants (record layout below) resolve at import, matching
 # _AOS; the kernel build adds -DRNK to match (r8i4_score_cuda._get).
+# Domain = any integer >= 1 (knob contract, ruling 2026-07-30); the upper
+# bound RNK < page (centered-gram rank ceiling) is enforced at geometry
+# validation, where page is known. r=1 is the allowed near-degenerate edge
+# (single basis column; scales lean on the clamp_min floors). The Hopper
+# CUDA score kernel keeps its own RNK in {2,4,8} #error (loud, no fallback).
 RNK = int(os.environ.get("LOCKS_R8I4_RANK", "8"))
-assert RNK in (2, 4, 8), f"LOCKS_R8I4_RANK must be 2|4|8, got {RNK}"
+assert RNK >= 1, f"LOCKS_R8I4_RANK must be a positive integer, got {RNK}"
+
+# V-basis quant bit-width knob (knob contract P2, ruling 2026-07-30): the
+# i-axis quantizes the V BASIS ONLY -- C (pp_c8), mu (pp_mu8) and the cs/mus/
+# vs scales are i-invariant. Module-import env symmetric with LOCKS_R8I4_RANK
+# so the record layout below resolves at import. i4 is the shipped path and
+# must stay byte-identical (the regression anchor); i8 = no packing, i2 = 4
+# values/byte. The Hopper CUDA score TU is int4-hardcoded and asserts i4 at
+# build time (r8i4_score_cuda._get) -- loud, never a silent wrong-width read.
+IBITS = int(os.environ.get("LOCKS_R8I4_IBITS", "4"))
+assert IBITS in (2, 4, 8), f"LOCKS_R8I4_IBITS must be 2|4|8, got {IBITS}"
+# Per-column quant range: QMAX = 2^(i-1)-1, QMIN = -2^(i-1) (asymmetric
+# signed, the shipped i4 -8..7 generalized). Single source for build + twin.
+QMAX = (1 << (IBITS - 1)) - 1
+QMIN = -(1 << (IBITS - 1))
 
 # MUC (doc 25/25b): mu rides the mma's dead basis columns at RNK<8.
 # Default ON for rank<8 (4/4 bitwise gates + e2e composition verified,
 # 2026-07-17); LOCKS_R8I4_MUC=0 is the kill switch. r8 stage 2 pending.
-MUC = os.environ.get("LOCKS_R8I4_MUC", "1" if RNK < 8 else "0") == "1"
-assert not (MUC and RNK == 8), "MUC stage 1 covers RNK<8 only"
+# rank v2 (2026-07-27): MUC is AOS-only machinery (the kernel #error always
+# enforced AOS+BIAS); now that rank<8 also rides the SIX-SLAB lane (<512K),
+# the default is ON only when the AOS build is requested -- otherwise the
+# builder would permute mu for a kernel with no MUC read path (G8), the
+# exact bug class of MUC_G4_RANK_BUG.
+MUC = os.environ.get(
+    "LOCKS_R8I4_MUC",
+    "1" if (RNK < 8 and os.environ.get("R8I4_MMA_AOS")) else "0") == "1"
+assert not (MUC and RNK >= 8), "MUC stage 1 covers RNK<8 only " \
+    "(mu rides the mma's dead basis columns; none exist at RNK >= 8)"
 
 # AoS record mode (R8I4_MMA_AOS): the six score-read components live in ONE
 # 64B-aligned record per (page, kv-head) -- [v4 RNK*d/2 | mu 128 | c8
@@ -80,22 +112,33 @@ def _rec_bytes_aos(d: int, page: int) -> int:
 _REC_BYTES = _rec_bytes_aos(128, 16)
 
 
+def _v_bytes(d: int) -> int:
+    """V-basis slab bytes: RNK columns of d IBITS-bit values, packed at
+    PPB = 8//IBITS values/byte. IBITS=4 reproduces the shipped RNK*d/2
+    byte-for-byte (the i4 regression anchor); i8 -> RNK*d, i2 -> RNK*d/4.
+    d*IBITS is byte-aligned for every supported (d, i) pair (asserted at
+    alloc), so the ceil never rounds."""
+    return RNK * ((d * IBITS + 7) // 8)
+
+
 def record_bytes(d: int, page: int, tagw: int = TAGW) -> int:
     """Per-(page, kv-head) r8i4 slab footprint in bytes, INCLUDING the tag.
 
     Single source of truth for the mem spec-v2 engine page sizing
     (backend/register._summary_head_size) and the memplan NB-overhead
     accounting. Mirrors the R8i4State allocation exactly:
-      v4 RNK*d/2 (u8) + vs RNK*2 (bf16) + c8 page*RNK (i8) + cs page*2 (bf16)
-      + mu8 d (i8) + mus 2 (bf16) + tag tagw*2 (bf16)
-    = 5d + 10*page + 18 + 2*tagw (834 B at d=128, page 16, tagw 8).
+      vb RNK*d*i/8 (u8) + vs RNK*2 (bf16) + c8 page*RNK (i8) + cs page*2
+      (bf16) + mu8 d (i8) + mus 2 (bf16) + tag tagw*2 (bf16)
+    = 5d + 10*page + 18 + 2*tagw at the i4 default (834 B at d=128, page 16,
+    tagw 8); only the V term moves with i.
     R8I4_MMA_AOS: the six components pad to one 832B record (+ the tag
     slab), so the footprint is 832 + 2*tagw (848 at tagw 8)."""
     if _AOS:
         assert d == 128 and page == 16, \
             "AOS records cover the p16 d128 flagship only"
+        assert IBITS == 4, "AOS records cover the i4 flagship only"
         return _REC_BYTES + tagw * 2
-    return RNK * d // 2 + RNK * 2 + page * RNK + page * 2 + d + 2 + tagw * 2
+    return _v_bytes(d) + RNK * 2 + page * RNK + page * 2 + d + 2 + tagw * 2
 
 
 def record_bytes_padded(d: int, page: int, elem: int = 2,
@@ -140,6 +183,7 @@ class R8i4State:
         L, NB, D, MP, R = num_layers, num_blocks, head_dim, max_pages, max_reqs
         self.L, self.NB, self.n_kv, self.G, self.d = L, NB, n_kv, G, D
         self.page, self.r, self.tagw = page, RNK, tagw
+        self.v_bits = IBITS      # V-basis quant width (the builder banner)
         self.max_reqs, self.max_pages = R, MP
         self.budget = float(budget)
         self.budget_abs = int(budget_pages or 0)   # >0 => fixed-B static budget
@@ -159,6 +203,7 @@ class R8i4State:
             # (r8i4_score_cuda: MU = RNK*d/2, then C8/CS/VS/MUS packed).
             assert D == 128 and page == 16, \
                 "AOS records cover the p16 d128 flagship only"
+            assert IBITS == 4, "AOS records cover the i4 flagship only"
             o_mu = RNK * D // 2
             o_c8 = o_mu + D
             o_cs = o_c8 + page * RNK
@@ -179,8 +224,12 @@ class R8i4State:
             self.pp_nrmC = r_[..., o_mus + 2:o_mus + 4].view(bf16).squeeze(-1)
         else:
             self.pp_rec = None
-            self.pp_v4 = torch.zeros(L, NB, n_kv, RNK, D // 2, device=device,
-                                     dtype=u8)
+            # V basis at IBITS bits/value: per-column packed width d*i/8
+            # (i4 -> d/2, the shipped layout; i8 -> d; i2 -> d/4).
+            assert D * IBITS % 8 == 0, \
+                f"V column d={D} x {IBITS} bits must be byte-aligned"
+            self.pp_v4 = torch.zeros(L, NB, n_kv, RNK, D * IBITS // 8,
+                                     device=device, dtype=u8)
             self.pp_vs = torch.zeros(L, NB, n_kv, RNK, device=device,
                                      dtype=bf16)
             self.pp_c8 = torch.zeros(L, NB, n_kv, page, RNK, device=device,
@@ -258,8 +307,28 @@ class R8i4State:
             "G <= 8; a G>8 model boots and dies on the first decode step. "
             "Split the KV heads across more TP ranks to bring G <= 8, or "
             "extend the selector.")
-        assert page in (16, 32), \
-            f"r8i4 supports page in {{16, 32}}, engine block_size={page}"
+        # page domain = multiples of 16 {16,32,64} (ruling 2026-07-30). page 64
+        # rides the SIX-SLAB lane only: torch score twin (sm_120), the build
+        # (page x page gram + eigh, page-parametric), the six-slab record
+        # (page*RNK C-slab), the Triton decode (PAGE constexpr, tl.arange(0,PAGE)
+        # -- 64 is pow2) and the nrm+topb select (page-count, not page-size).
+        # The AOS record (r8i4_state.py:102/167) + Hopper CUDA score/decode
+        # kernels still assert page in {16,32}; page=64 hits those loudly (never
+        # a silent wrong path) until they gain a p64 case. page=8 is BLOCKED
+        # UPSTREAM by vLLM FlashAttention (block_size must be a multiple of 16;
+        # flash_attn.py:148) -- the engine cannot init at block_size 8, so it is
+        # out of the supported domain regardless of the LOCKS lanes.
+        assert page in (16, 32, 64), \
+            f"r8i4 supports page in {{16, 32, 64}} (vLLM FlashAttention needs " \
+            f"block_size a multiple of 16), engine block_size={page}"
+        # Rank upper bound (knob contract, ruling 2026-07-30): the centered
+        # page-gram dc@dc^T has rank <= page-1, so RNK >= page is DEGENERATE
+        # (top-RNK includes ~0 eigenvalues; no compression). RNK is an
+        # import-time constant but page is only known here -- the domain
+        # check completes at geometry validation: 1 <= RNK < page.
+        assert RNK < page, (
+            f"r8i4 rank must satisfy 1 <= RNK < page (centered-gram rank "
+            f"ceiling is page-1), got LOCKS_R8I4_RANK={RNK} at page={page}")
         assert rank == RNK, \
             f"r8i4 rank is fixed at import by LOCKS_R8I4_RANK={RNK} " \
             f"(the packed layout + kernel -DRNK), got rank={rank}"
