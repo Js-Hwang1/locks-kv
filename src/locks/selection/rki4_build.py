@@ -1,4 +1,4 @@
-"""r8i4 build / refresh -- the packed rank-8 page-projection summary (r8i4).
+"""rki4 build / refresh -- the packed rank-8 page-projection summary (rki4).
 
 Port of ``LOCKS-test2/kernel/r8score_cuda.py::build_summary`` into the mainline
 build lifecycle (same page-finalize discipline as ``build.py`` /
@@ -31,7 +31,7 @@ deviations from ``build.py``:
     contract against the standalone constructor.
   * V is quantized ``round(V/(absmax/QMAX)).clamp(QMIN, QMAX)`` (the
     standalone's asymmetric range; i4 default ``/7, -8..7``), not the
-    symmetric +-7 of ``build._quant``. The i-axis (LOCKS_R8I4_IBITS)
+    symmetric +-7 of ``build._quant``. The i-axis (LOCKS_RKI4_IBITS)
     moves ONLY this V quant + pack; C/mu stay int8.
 
 NOT graph-safe by design (eigh + gathers); runs on page-finalize off the hot
@@ -45,11 +45,11 @@ import torch
 
 from .build import (_build_blocks, _bulk_blocks, _delta_select,
                     _scatter_index, _tail_blocks)
-from .r8i4_state import IBITS, QMAX, QMIN, RNK, R8i4State
+from .rki4_state import IBITS, QMAX, QMIN, RNK, Rki4State
 
 from .. import quant as _kvq   # KV-quant study seam; _kvq.KVQ None = inert
 
-from .r8i4_state import MUC as _MUC  # doc 25: default-on at RNK<8
+from .rki4_state import MUC as _MUC  # doc 25: default-on at RNK<8
 
 # build_summary's eigh chunk: cusolver batched syev fails above ~16k matrices.
 # LOCKS_EIGH_CHUNK overrides the chunk for the TTFT chunk-size lever.  This is
@@ -70,17 +70,17 @@ _EIGH_CHUNK = int(os.environ.get("LOCKS_EIGH_CHUNK", "8192"))
 # Off by default because the swap is value-equivalent but NOT bitwise (the
 # top-8 eigenbasis differs by a harmless sign/rotation), so existing
 # G2-bitwise regression checks stay on cusolver. See ours_doc/TTFT_16K_KERNEL.md.
-_R8I4_EIGH = os.environ.get("LOCKS_R8I4_EIGH", "cusolver").strip().lower()
+_RKI4_EIGH = os.environ.get("LOCKS_RKI4_EIGH", "cusolver").strip().lower()
 
 # LOCKS_BUILD_TIME=1: cumulative build-eigh profiler (mirrors the score
-# profiler's LOCKS_R8I4_TIME). Prints total eigh wall + gram count per call.
+# profiler's LOCKS_RKI4_TIME). Prints total eigh wall + gram count per call.
 _EIGH_MS = 0.0
 _EIGH_N = 0
 _EIGH_GRAMS = 0
 
 # LOCKS_TAIL_GRAPH (2026-07-19): CUDA-graph the bs=1 page-crossing tail
 # refresh -- two captured graphs around the (non-capturable) cusolver eigh,
-# replayed with static buffers (r8i4_tailgraph).  graphprof measured the
+# replayed with static buffers (rki4_tailgraph).  graphprof measured the
 # eager chain at 3.6-4.0 ms inter-graph wall every 16th step (~176 launches,
 # 2.7-3.1 ms GPU-idle); the standalone prototype (scratch_qgemv/
 # refresh_probe.py) cut host-blocking 2118 -> 326 us with the slab bytes
@@ -92,10 +92,10 @@ _TAIL_GRAPH = os.environ.get("LOCKS_TAIL_GRAPH", "0") == "1"
 
 def _eigh_chunked(Gf: torch.Tensor):
     """(M, n, n) fp32 grams -> (S2, U) ascending, chunked at ``_EIGH_CHUNK``
-    (the standalone constructor's exact loop). LOCKS_R8I4_EIGH=jacobi swaps in
+    (the standalone constructor's exact loop). LOCKS_RKI4_EIGH=jacobi swaps in
     the fused dual-gram Jacobi kernel for the 16x16 grams (gate-licensed);
-    LOCKS_R8I4_EIGH=syevd routes to the direct cusolverDnXsyevBatched binding
-    with a PERSISTENT workspace (r8i4_syevd.eigh_syevd) -- BITWISE-identical to
+    LOCKS_RKI4_EIGH=syevd routes to the direct cusolverDnXsyevBatched binding
+    with a PERSISTENT workspace (rki4_syevd.eigh_syevd) -- BITWISE-identical to
     torch.linalg.eigh (same routine, S2/U max|d|=0 gate), but the ~2.4 GiB
     workspace is mapped once and reused, removing the per-build cuMem* churn
     that dominates the summary-build TTFT cost, and the call omits the info
@@ -106,11 +106,11 @@ def _eigh_chunked(Gf: torch.Tensor):
         _be0 = torch.cuda.Event(enable_timing=True)
         _be1 = torch.cuda.Event(enable_timing=True)
         _be0.record()
-    if _R8I4_EIGH in ("jacobi", "dual") and Gf.shape[-1] == 16:
+    if _RKI4_EIGH in ("jacobi", "dual") and Gf.shape[-1] == 16:
         from .jacobi_dual import eigh_dual
         res = eigh_dual(Gf)
-    elif _R8I4_EIGH == "syevd":
-        from .r8i4_syevd import eigh_syevd
+    elif _RKI4_EIGH == "syevd":
+        from .rki4_syevd import eigh_syevd
         res = eigh_syevd(Gf, _EIGH_CHUNK)
     else:
         n = Gf.shape[-1]
@@ -130,7 +130,7 @@ def _eigh_chunked(Gf: torch.Tensor):
 
 
 # --------------------------------------------------------------------------- #
-def _mask_blocks(st: R8i4State, K: torch.Tensor,
+def _mask_blocks(st: Rki4State, K: torch.Tensor,
                  blocks: torch.Tensor) -> torch.Tensor:
     """Bound physical-block indices to BOTH the state slab and the K tensor
     (sync-free boolean mask). The engine's memory-profile pass hands a
@@ -144,11 +144,11 @@ def _mask_blocks(st: R8i4State, K: torch.Tensor,
     return blocks[(blocks >= 0) & (blocks < nb)]
 
 
-def _write_pre(st: R8i4State, Kp_flat: torch.Tensor):
-    """Stage A of ``_r8i4_write``: gather-side math up to the page grams.
-    Split point = the eigh call, so the tail graph (``r8i4_tailgraph``) can
+def _write_pre(st: Rki4State, Kp_flat: torch.Tensor):
+    """Stage A of ``_rki4_write``: gather-side math up to the page grams.
+    Split point = the eigh call, so the tail graph (``rki4_tailgraph``) can
     CUDA-graph A/B around the non-capturable cusolver solve.  Op order is
-    ``_r8i4_write``'s, unchanged (pure extraction)."""
+    ``_rki4_write``'s, unchanged (pure extraction)."""
     page, tagw = st.page, st.tagw
     tag_new = Kp_flat[:, page - 1, :, :tagw]
     K = Kp_flat.permute(0, 2, 1, 3).float().contiguous()   # (N, n_kv, page, d)
@@ -175,8 +175,8 @@ def _pack_ibit(Vc: torch.Tensor) -> torch.Tensor:
     return out.contiguous()
 
 
-def _write_post(st: R8i4State, mu, dc, S2, U, tag_new, lidx, bidx) -> None:
-    """Stage B of ``_r8i4_write``: eigh consumers -> quantize -> slab scatter.
+def _write_post(st: Rki4State, mu, dc, S2, U, tag_new, lidx, bidx) -> None:
+    """Stage B of ``_rki4_write``: eigh consumers -> quantize -> slab scatter.
     Op order unchanged (pure extraction; see ``_write_pre``)."""
     page = st.page
     N, n_kv = mu.shape[0], mu.shape[1]
@@ -208,7 +208,7 @@ def _write_post(st: R8i4State, mu, dc, S2, U, tag_new, lidx, bidx) -> None:
         # MUC (doc 25): store mu even/odd-d packed (the mma B-fragment order,
         # matching the q8e/q8o A staging); values unchanged, order only.
         # G==8 GATE (MUC_G4_RANK_BUG_2026-07-25): the even/odd layout is what
-        # the G8 USE_MMA path consumes under #ifdef R8I4_MMA_MUC; the G4
+        # the G8 USE_MMA path consumes under #ifdef RKI4_MMA_MUC; the G4
         # non-MMA path has NO MUC handling and read the permuted mu as natural
         # order -- scrambling every page's centroid term (RULER-16K r4: 38.7
         # vs 93.4 with the permute off). G<8 states now store natural order,
@@ -225,10 +225,10 @@ def _write_post(st: R8i4State, mu, dc, S2, U, tag_new, lidx, bidx) -> None:
     st.pp_tag[lidx, bidx] = tag_new.to(st.pp_tag.dtype)
 
 
-def _r8i4_write(st: R8i4State, Kp_flat: torch.Tensor, lidx: torch.Tensor,
+def _rki4_write(st: Rki4State, Kp_flat: torch.Tensor, lidx: torch.Tensor,
                 bidx: torch.Tensor) -> None:
     """Summarize + quantize + scatter ``Kp_flat`` (N, page, n_kv, d) into the
-    r8i4 slabs at the flat (layer, block) index pairs.  Sync-free.  The op
+    rki4 slabs at the flat (layer, block) index pairs.  Sync-free.  The op
     chain (``_write_pre`` -> eigh -> ``_write_post``) is line-for-line
     ``build_summary`` on (N, n_kv)-batched pages (the standalone batches
     (n_kv, P); per-matrix ops are batch-order independent, verified bitwise
@@ -261,16 +261,16 @@ def _r8i4_write(st: R8i4State, Kp_flat: torch.Tensor, lidx: torch.Tensor,
     _write_post(st, mu, dc, S2, U, tag_new, lidx, bidx)
 
 
-def r8i4_build_tail(st: R8i4State, K_layers, block_table: torch.Tensor,
+def rki4_build_tail(st: Rki4State, K_layers, block_table: torch.Tensor,
                     seq_lens: torch.Tensor, n_req: int, rows=None) -> int:
     """Batched all-layer rebuild of the last finalized page of ``rows`` (or of
-    every request).  r8i4 twin of :func:`locks.selection.build.r8_build_tail`
+    every request).  rki4 twin of :func:`locks.selection.build.r8_build_tail`
     (rationale there): zero device syncs, idempotent.  Called by the builder
     on steady finalize steps only (the ``cur % page == 1`` settled gate)."""
     if n_req == 0:
         return 0
     if _TAIL_GRAPH:
-        from .r8i4_tailgraph import tail_graph_run
+        from .rki4_tailgraph import tail_graph_run
         r = tail_graph_run(st, K_layers, block_table, seq_lens, n_req, rows)
         if r is not None:
             return r
@@ -286,41 +286,41 @@ def r8i4_build_tail(st: R8i4State, K_layers, block_table: torch.Tensor,
     # SELECT_KERNEL_CAMPAIGN.md section 12 + ours_doc/REFUTED_ARMS_INDEX.md.)
     Kp_raw = torch.stack([K[blocks] for K in K_layers])      # (L,n,page,n_kv,d)
     lidx, bidx = _scatter_index(L, 0, blocks)
-    _r8i4_write(st, Kp_raw.reshape(L * n, st.page, st.n_kv, st.d), lidx, bidx)
+    _rki4_write(st, Kp_raw.reshape(L * n, st.page, st.n_kv, st.d), lidx, bidx)
     return L * n
 
 
-def r8i4_build_bulk(st: R8i4State, K_layers, block_table: torch.Tensor,
+def rki4_build_bulk(st: Rki4State, K_layers, block_table: torch.Tensor,
                     seq_lens: torch.Tensor, n_req: int, max_fin: int,
                     chunk_pairs: int = 8192) -> int:
-    """Rebuild ALL finalized pages for ALL layers, zero syncs; r8i4 twin of
+    """Rebuild ALL finalized pages for ALL layers, zero syncs; rki4 twin of
     :func:`locks.selection.build.r8_build_bulk` (rationale there)."""
     if n_req == 0 or max_fin <= 0:
         return 0
     blocks = _bulk_blocks(block_table, seq_lens, n_req, page=st.page,
                           max_fin=max_fin)
     blocks = _mask_blocks(st, K_layers[0], blocks)
-    return _build_blocks(_r8i4_write, st, K_layers, blocks, chunk_pairs)
+    return _build_blocks(_rki4_write, st, K_layers, blocks, chunk_pairs)
 
 
-def r8i4_build_delta(st: R8i4State, K_layers, block_table: torch.Tensor,
+def rki4_build_delta(st: Rki4State, K_layers, block_table: torch.Tensor,
                      seq_lens: torch.Tensor, n_req: int, max_fin: int,
                      chunk_pairs: int = 8192) -> int:
     """Composition-change rebuild: only blocks whose content tag went stale;
-    r8i4 twin of :func:`locks.selection.build.r8_build_delta`."""
+    rki4 twin of :func:`locks.selection.build.r8_build_delta`."""
     if n_req == 0 or max_fin <= 0:
         return 0
     blocks = _delta_select(st.pp_tag, K_layers, block_table, seq_lens,
                            n_req, st.page, max_fin, st.tagw)
     blocks = _mask_blocks(st, K_layers[0], blocks)
-    return _build_blocks(_r8i4_write, st, K_layers, blocks, chunk_pairs)
+    return _build_blocks(_rki4_write, st, K_layers, blocks, chunk_pairs)
 
 
 # --------------------------------------------------------------------------- #
-def r8i4_build_refresh(st: R8i4State, layer: int, K: torch.Tensor,
+def rki4_build_refresh(st: Rki4State, layer: int, K: torch.Tensor,
                        block_table: torch.Tensor, seq_lens: torch.Tensor,
                        n_req: int, *, force: bool = False) -> int:
-    """(Re)build the r8i4 summary for every STALE finalized page of the batch.
+    """(Re)build the rki4 summary for every STALE finalized page of the batch.
 
     K            per-layer key view (NB, page, n_kv, d), the engine K half.
     block_table  (n_req, max_blocks) int32, logical page -> physical block.
@@ -360,5 +360,5 @@ def r8i4_build_refresh(st: R8i4State, layer: int, K: torch.Tensor,
     if sb.numel() == 0:
         return 0
     lidx = torch.full((sb.numel(),), layer, device=device, dtype=torch.int64)
-    _r8i4_write(st, K[sb], lidx, sb)
+    _rki4_write(st, K[sb], lidx, sb)
     return int(sb.numel())

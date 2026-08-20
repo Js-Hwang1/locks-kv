@@ -16,7 +16,7 @@ row 0) moved INSIDE graph A reading two static input buffers refreshed by
 plain ``copy_`` per crossing -- the per-crossing eager work is now 2 copies
 + replay A + eigh + 2 copies + replay B (was ~7 extra eager launches).
 
-Stage math = ``r8i4_build._write_pre`` / ``_write_post`` -- the SAME
+Stage math = ``rki4_build._write_pre`` / ``_write_post`` -- the SAME
 functions the eager path runs, so the replayed kernels are bit-identical
 (standalone gates G1-G3 in scratch_qgemv/gate_tailgraph.py incl. the
 changed-block replay; in-engine: suite both flag states + PTAB step-40
@@ -44,7 +44,7 @@ import traceback
 
 import torch
 
-from .r8i4_build import _eigh_chunked, _write_post, _write_pre
+from .rki4_build import _eigh_chunked, _write_post, _write_pre
 
 _WRAP_EXT = None
 _INPROF = [None]          # resolved lazily; [None] -> unresolved
@@ -237,7 +237,7 @@ class _TailGraph:
 
 
 def tail_graph_run(st, K_layers, block_table, seq_lens, n_req, rows):
-    """Entry used by ``r8i4_build_tail`` under LOCKS_TAIL_GRAPH=1.
+    """Entry used by ``rki4_build_tail`` under LOCKS_TAIL_GRAPH=1.
     Returns the rebuilt count, or None -> caller runs the eager path."""
     tg = getattr(st, "_tailgraph", None)
     if tg is None:

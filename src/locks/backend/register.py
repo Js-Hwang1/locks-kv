@@ -73,10 +73,10 @@ class LocksAttentionBackend(FlashAttentionBackend):
 def _summary_head_size(cfg, block_size: int, head_size: int = 128) -> int:
     """P5 spec v2: the re-keyed engine head_size so a page holds exactly
     ``n_kv x rec_bytes`` summary records (elem=2 bf16).  Single source of
-    truth: ``r8i4_state.record_bytes_padded`` (padded up so the record tiles
+    truth: ``rki4_state.record_bytes_padded`` (padded up so the record tiles
     the page)."""
     elem = 2
-    from ..selection.r8i4_state import record_bytes_padded
+    from ..selection.rki4_state import record_bytes_padded
     rec_bytes = record_bytes_padded(d=head_size, page=block_size, elem=elem)
     if rec_bytes % (block_size * elem) != 0:
         raise ValueError(
@@ -203,7 +203,7 @@ def register(overrides: dict | None = None) -> None:
         os.environ["VLLM_CACHE_ROOT"] = os.path.join(_root, _tag)
         _wire_qfirst()
     # QFIRST_CO (P2b, the co-kernel lane; user "make it work" order
-    # 2026-07-20): ONE opaque op = q-GEMV -> [kv-GEMV || r8i4 score] fat
+    # 2026-07-20): ONE opaque op = q-GEMV -> [kv-GEMV || rki4 score] fat
     # kernel (no streams/events/joins -- main-stream order is the sync);
     # prefill ropes IN the op body (stock bytes, no view-mutating ops in
     # the trace -> no clones).  Consumers ride the NOROPE machinery

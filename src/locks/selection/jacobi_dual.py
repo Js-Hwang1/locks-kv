@@ -1,13 +1,13 @@
 """Fused batched 16x16 symmetric eigensolver -- DUAL-gram parallel Jacobi.
 
-Drop-in for ``torch.linalg.eigh`` on the r8i4 page-grams (16x16), 2.80x over
+Drop-in for ``torch.linalg.eigh`` on the rki4 page-grams (16x16), 2.80x over
 cusolver at the 16K point (4096 grams) and 2.2-2.9x across 4K-262K grams
 (H200). Two grams per warp (lanes 0-15 gram A, 16-31 gram B) so every lane is
 busy in the column/row phases -- the shipped ``build._eigh_jacobi`` wastes
 16/32 lanes and is only 1.01x at 16K. No per-matrix cusolver launch, no batch
 ceiling.
 
-Gauge note: only the TOP-8 eigenpairs feed the r8i4 summary, and
+Gauge note: only the TOP-8 eigenpairs feed the rki4 summary, and
 ``C V^T = U8 U8^T dc`` (the projection onto the top-8 eigenspace) is invariant
 to eigenvector sign/rotation inside that subspace, so a different-but-equivalent
 factorization reconstructs the SAME per-token page-LSE => same selection => same
@@ -145,7 +145,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 _MOD = None
 _TRIED = False
-_SWEEPS = int(os.environ.get("LOCKS_R8I4_EIGH_SWEEPS", "8"))
+_SWEEPS = int(os.environ.get("LOCKS_RKI4_EIGH_SWEEPS", "8"))
 
 
 def _mod():

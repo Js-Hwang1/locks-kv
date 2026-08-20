@@ -29,7 +29,7 @@ def _page_basis(blk, r):
 
     This is the construction the method is defined by (eigendecompose the page
     Gram $D D^\\top \\in R^{B x B}$) and the one the GQA path already uses
-    (``r8i4_syevd`` -> ``cusolverDnXsyevBatched``). The MLA path used to call
+    (``rki4_syevd`` -> ``cusolverDnXsyevBatched``). The MLA path used to call
     ``torch.linalg.svd`` on the [n, page, Lkv] = [n, 64, 512] blocks instead,
     which dispatches to a Jacobi-type cuSOLVER routine: on 2026-08-13 that
     WEDGED for 44 h on 8 H200s with every TP rank parked in this one call, so

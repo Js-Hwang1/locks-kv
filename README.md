@@ -1,7 +1,7 @@
 # LOCKS
 
 **Page-Local Compact Key Summaries for efficient long-context decoding.** LOCKS
-gives each KV *page* a compact, query-independent summary of its keys (the `r8i4`
+gives each KV *page* a compact, query-independent summary of its keys (the `rki4`
 rank-8 int-4 page summary) and, at every decode step, attends only the top-`b`
 pages that summary ranks highest per (layer, KV-head) -- always keeping the sink
 and most-recent pages. Because the summary tracks each page's *exact* attention
@@ -162,7 +162,7 @@ Note: MLA currently supports the `fast` variant with a fixed budget
 
 ## How it works
 
-- **Selection (Stage A).** Each page carries a query-independent **r8i4** summary
+- **Selection (Stage A).** Each page carries a query-independent **rki4** summary
   built when the page finalizes: an int-4 column-major basis + int8 coefficients +
   an int8 page centroid, from the page-gram eigendecomposition. A query scores
   every page directly (a per-head page-mass estimate) and a static top-`b` keeps

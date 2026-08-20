@@ -87,10 +87,10 @@ def build_plan(vllm_config, cfg: LocksConfig) -> MemPlan:
     kv_mult = 2 if cfg.offload_k else 1          # K+V pools vs V-only
 
     # ---- summary record size (single source of truth) --------------------- #
-    # r8i4 packed slab per (page, kv-head), incl. tag; the engine page under
+    # rki4 packed slab per (page, kv-head), incl. tag; the engine page under
     # the summary cache is the PADDED size (register._summary_head_size), the
-    # NB-keyed R8i4State slabs the exact one.
-    from ..selection.r8i4_state import record_bytes, record_bytes_padded
+    # NB-keyed Rki4State slabs the exact one.
+    from ..selection.rki4_state import record_bytes, record_bytes_padded
     rec_bytes = record_bytes(d=d, page=page)
     rec_bytes_engine = record_bytes_padded(d=d, page=page, elem=elem)
 
@@ -200,7 +200,7 @@ def host_capped_num_blocks(plan: "MemPlan", cfg: LocksConfig,
     GiB -> pool.py RAISE at boot.  This bounds NB to the largest batch host DRAM
     can back (num_gpu_blocks_override), the honest capacity ceiling.
 
-    DEMAND CAP (LOCKS_MEM_R8I4.md B1): every NB-keyed structure (pinned pools,
+    DEMAND CAP (LOCKS_MEM_RKI4.md B1): every NB-keyed structure (pinned pools,
     summary slabs, residency maps) scales with NB, and under the mem scope
     (prefix caching refused at builder init) at most ``max_reqs x max_pages``
     blocks can ever be mapped at once -- any NB above that is pure host/VRAM

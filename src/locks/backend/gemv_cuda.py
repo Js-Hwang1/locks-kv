@@ -230,7 +230,7 @@ void qkv_gemv(torch::Tensor x, torch::Tensor W, torch::Tensor b,
 // runs on an otherwise idle machine (session-P probe 4: joint 0.68..0.75x
 // serial).  SAFETY ARGUMENT (audit D-4, the transitive chain): this
 // kernel reads ONLY x = the rms output and the static W/bias slabs.  The
-// chain rms -> q_gemv -> r8i4_score_bt -> [hmax refill] -> select_v2 is
+// chain rms -> q_gemv -> rki4_score_bt -> [hmax refill] -> select_v2 is
 // PLAIN-launched under the FIX-C construction (LOCKS_PDL=0 on H200);
 // every plain launch is a full completion + visibility point, so by the
 // time select_v2 BEGINS execution (the earliest instant its entry trigger

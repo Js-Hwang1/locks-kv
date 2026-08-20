@@ -594,7 +594,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             # LOCKS_TIER_ASSERT.  The control confirms the mechanism:
             # fast-mns1 vs fast-mns4 diverges the same way (fast changed
             # function, not mem).  Regression gate going forward =
-            # scratch_mem_r8i4/sys_eq_amass.py compared MEM-vs-MEM across
+            # scratch_mem_rki4/sys_eq_amass.py compared MEM-vs-MEM across
             # mns (self-consistency), not fast-vs-mem.  The fast arm's
             # mixed-window dense delegation stands recorded as a FAST-arm
             # semantic inconsistency (paper note).
@@ -684,24 +684,24 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             layer_kv.append(kvc)
             ptr2layer[kvc.data_ptr()] = lidx
 
-        # r8i4 geometry contract: validate BEFORE the blanket alloc
+        # rki4 geometry contract: validate BEFORE the blanket alloc
         # try/except below, which exists to degrade genuine OOM to the FullKV
         # delegation -- it must NOT swallow the supported-geometry asserts
         # (an unsupported model would silently serve FullKV while tagged
-        # r8i4). quad/clse/r8 keep the existing semantics unchanged.
-        if True:   # r8i4 geometry contract: validate BEFORE the alloc guard
-            from ..selection.r8i4_state import R8i4State as _R8i4Geom
-            _R8i4Geom.validate_geometry(
+        # rki4). quad/clse/r8 keep the existing semantics unchanged.
+        if True:   # rki4 geometry contract: validate BEFORE the alloc guard
+            from ..selection.rki4_state import Rki4State as _Rki4Geom
+            _Rki4Geom.validate_geometry(
                 head_dim=self.headdim,
                 G=self.num_heads_q // self.num_heads_kv,
                 page=self.block_size)
 
         try:
             cfg = self._cfg
-            # ONE summary state: r8i4 (the quad / clse / r8 variants were
+            # ONE summary state: rki4 (the quad / clse / r8 variants were
             # deleted 2026-07-22).
-            from ..selection import R8i4State as _State
-            from ..selection.r8i4_state import RNK as rank  # LOCKS_R8I4_RANK (1 <= r < page)
+            from ..selection import Rki4State as _State
+            from ..selection.rki4_state import RNK as rank  # LOCKS_RKI4_RANK (1 <= r < page)
             n_kv = self.num_heads_kv
             G = self.num_heads_q // n_kv
             max_reqs = self._vllm_config.scheduler_config.max_num_seqs
@@ -712,12 +712,12 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             # fall back to a fixed fraction (no adaptive per-head b).
             budget = cfg.budget if cfg.budget is not None else 0.1
             # The GQA combine (nrm default) + the score-kernel zsplit, which is
-            # resolved ONCE here (config field / LOCKS_R8I4_Z, read in
+            # resolved ONCE here (config field / LOCKS_RKI4_Z, read in
             # LocksConfig.load -- never per call; None = auto-size from the
             # device SM count at launch).
             extra_state = {}
             extra_state["combine"] = cfg.quad_combine
-            extra_state["zsplit"] = getattr(cfg, "r8i4_zsplit", None)
+            extra_state["zsplit"] = getattr(cfg, "rki4_zsplit", None)
             st = _State(
                 self._device, num_layers=len(self._layer_names),
                 num_blocks=int(nb), n_kv=n_kv, G=G, head_dim=self.headdim,
@@ -743,7 +743,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             else:
                 self._layer_k = [_split_kv(kvc)[0] for kvc in layer_kv]
             # KV-QUANT STUDY (locks.quant, LOCKS_KVQ): stash the engine (K, V)
-            # half views so the r8i4 build hook can fake-quant finalized pages
+            # half views so the rki4 build hook can fake-quant finalized pages
             # in place (stage pre/post).  Inert when LOCKS_KVQ is unset/off.
             from .. import quant as _kvq
             if _kvq.KVQ is not None:
@@ -755,7 +755,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             self._state = st
             if not getattr(cfg, "mem_summary_cache", False):
                 self._ensure_overlap(sfc)
-            print(f"[locks] {_State.__name__} ALLOCATED (score=r8i4): layers="
+            print(f"[locks] {_State.__name__} ALLOCATED (score=rki4): layers="
                   f"{st.L} num_blocks={st.NB} reqs={max_reqs} n_kv={n_kv} G={G} "
                   f"d={self.headdim} page={page} max_pages={max_pages} "
                   f"rank={st.r} v_bits={getattr(st, 'v_bits', '-')} "
@@ -798,7 +798,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
         if not _OVERLAP or self._ov is not None:
             return
         try:
-            from ..selection.r8i4_build import _r8i4_write as write_fn
+            from ..selection.rki4_build import _rki4_write as write_fn
             ov = _PrefillOverlap(self._device)
             ov.bind(self._state, self._layer_k, write_fn)
             n = ov.install(sfc, self._layer_names)
@@ -1325,8 +1325,8 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
             raise RuntimeError(
                 "locks mem_summary_cache: refresh fallback without host seq "
                 "lens reached -- the engine page holds records, not K; cannot "
-                "build summaries from it (LOCKS_MEM_R8I4.md B1)")
-        from ..selection import r8i4_build_refresh as _refresh
+                "build summaries from it (LOCKS_MEM_RKI4.md B1)")
+        from ..selection import rki4_build_refresh as _refresh
         bt = md.block_table
         # settled lengths (see _maybe_refresh): n_fin inside the refresh is
         # sl // page and must not count the in-flight tokens' pages (== -1 on
@@ -1354,7 +1354,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
     def _tail_refresh(self, st, md, n_req, rows):
         """Steady-state finalize step: batched all-layer sync-free rebuild of
         the crossing rows' last finalized page (selection.build.r8_build_tail)."""
-        from ..selection import r8i4_build_tail as _tail
+        from ..selection import rki4_build_tail as _tail
         # settled lengths: no-op for fin1 under the % page == 1 gate
         # ((sl-1)//page == sl//page there), kept for the uniform invariant.
         _tail(st, self._k_layers(), md.block_table,
@@ -1377,7 +1377,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
     def _bulk_refresh(self, st, md, n_req, max_fin, settled=None):
         """First decode step / slot change: batched zero-sync rebuild of ALL
         finalized pages, all layers (selection.build.r8_build_bulk)."""
-        from ..selection import r8i4_build_bulk as _bulk
+        from ..selection import rki4_build_bulk as _bulk
         if settled is None:
             settled = (md.seq_lens - 1).clamp(min=0)
         _bulk(st, self._k_layers(), md.block_table, settled, n_req, max_fin)
@@ -1385,7 +1385,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
     def _delta_refresh(self, st, md, n_req, max_fin, settled=None):
         """Batch-composition change: batched all-layer tag scan, rebuild only
         stale blocks (selection.build.r8_build_delta)."""
-        from ..selection import r8i4_build_delta as _delta
+        from ..selection import rki4_build_delta as _delta
         if settled is None:
             settled = (md.seq_lens - 1).clamp(min=0)
         _delta(st, self._k_layers(), md.block_table, settled, n_req, max_fin)
@@ -1409,8 +1409,8 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
         qsl = md.query_start_loc
         ql_dev = qsl[1:n_req + 1] - qsl[:n_req]
         settled = (md.seq_lens[:n_req] - ql_dev).clamp(min=0)
-        from ..selection import (r8i4_build_bulk as _bulk,
-                                 r8i4_build_delta as _delta)
+        from ..selection import (rki4_build_bulk as _bulk,
+                                 rki4_build_delta as _delta)
         if self._built_once:
             _delta(st, self._k_layers(), md.block_table, settled, n_req, max_fin)
         else:

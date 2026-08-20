@@ -1,7 +1,7 @@
-"""r8i4_score_cuda -- the S4 register-pipelined CUDA scorer for r8i4.
+"""rki4_score_cuda -- the S4 register-pipelined CUDA scorer for rki4.
 
 Mainline port of ``LOCKS-test2/kernel/r8score_cuda.py`` (ours_doc/
-R8I4_KERNELS.md sections 4-5), GEOMETRY-GENERALIZED: nothing model-specific is
+RKI4_KERNELS.md sections 4-5), GEOMETRY-GENERALIZED: nothing model-specific is
 hardcoded.  Per (page, kv-head) resident summary: V (d x 8 basis, int4,
 column-major packed, per-column bf16 scales), C (page x 8 coeffs, int8,
 per-token bf16 scales), mu (d, int8, bf16 scale).  Score per (g, page):
@@ -46,7 +46,7 @@ needs no extra preparation.
 
 Geometry is TORCH_CHECKed at launch against the supported set (d in {64, 128,
 256}, page in {16, 32}, G <= 16, rank 8); unsupported geometry raises --
-there is no fallback scorer for r8i4 (no Triton reference exists).
+there is no fallback scorer for rki4 (no Triton reference exists).
 """
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ _SRC = r"""
 #endif
 #define TB (NW * 32)
 #ifndef RNK
-#define RNK 8                // summary rank; -DRNK=4|2 via LOCKS_R8I4_RANK
+#define RNK 8                // summary rank; -DRNK=4|2 via LOCKS_RKI4_RANK
 #endif
 #if RNK != 8 && RNK != 4 && RNK != 2
 #error "RNK must be 8, 4, or 2"
@@ -81,7 +81,7 @@ _SRC = r"""
 // gating). rank<8 therefore rides r8's EXACT lane set at every ctx
 // (six-slab+HMAX/SEL_V2/CO at <512K, AOS+PFR at >=512K) with strictly
 // fewer bytes. v1's "MMA+AOS entries only" #error is retired.
-#if RNK != 8 && (defined(R8I4_MMA_S1PROBE) || defined(R8I4_CP_NODT) || defined(R8I4_CP_NOEXP))
+#if RNK != 8 && (defined(RKI4_MMA_S1PROBE) || defined(RKI4_CP_NODT) || defined(RKI4_CP_NOEXP))
 #error "RNK != 8 excludes V8/probe builds (rank campaign v1 scope)"
 #endif
 #define MAXG 16
@@ -141,8 +141,8 @@ __device__ __forceinline__ float locks_rope_elem(
 // cp.async 16B helper: used by the DEPLOYED PFR record ring (>=512K arm
 // set).  Loads only -> math/op-order unchanged -> score_h bitwise-invariant.
 // cp.async.cg.shared.global is sm_80+ (valid on sm_90a).
-#ifdef R8I4_MMA
-#define R8I4_RING 3
+#ifdef RKI4_MMA
+#define RKI4_RING 3
 __device__ __forceinline__ void cpasync16(void* dst_smem, const void* src) {
     unsigned s = (unsigned)__cvta_generic_to_shared(dst_smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::
@@ -156,7 +156,7 @@ template <int N> __device__ __forceinline__ void cpasync_wait() {
 }
 #endif
 
-// R8I4_MMA: replace the dp4a projection (qt = V^T q, the DOMINANT ~2048-dp4a
+// RKI4_MMA: replace the dp4a projection (qt = V^T q, the DOMINANT ~2048-dp4a
 // term) with ONE int8 tensor-core matmul over the whole GQA group. A(16x32)=q
 // (rows 0-7 = the 8 query heads, single int8 limb; rows 8-15 = 0), B(32x8)=one
 // page's 8 basis columns, C(16x8)=qt[head][basis]. The K=128 contraction is
@@ -165,8 +165,8 @@ template <int N> __device__ __forceinline__ void cpasync_wait() {
 // already-staged q8e/q8o words. int8*int8->int32 is exact + associative, so C
 // is BITWISE-identical to the dp4a acci (same integer products, same sum). Only
 // the G8 d128 flagship instantiation activates it (if constexpr); the shipped
-// dp4a path is untouched when R8I4_MMA is not defined.
-#ifdef R8I4_MMA
+// dp4a path is untouched when RKI4_MMA is not defined.
+#ifdef RKI4_MMA
 __device__ __forceinline__ void r8_mma_s8(int d[4], const unsigned a[4],
                                           const unsigned b[2]) {
     asm volatile(
@@ -188,36 +188,36 @@ __device__ __forceinline__ unsigned r8_hi(unsigned w) {
 
 // Host-side record size: same formula as the kernel RECB (p16 d128 AOS
 // flagship geometry; 64B-aligned). r8: 832, r4: 512, r2: 384.
-#define R8I4_RECB_HOST (((RNK * 64 + 128 + 16 * RNK + 32 + 2 * RNK + 2) + 63) / 64 * 64)
+#define RKI4_RECB_HOST (((RNK * 64 + 128 + 16 * RNK + 32 + 2 * RNK + 2) + 63) / 64 * 64)
 
-// R8I4_MMA_SRED: strength-reduced addressing for the G8 d128 mma page loop.
-// DEFAULT-ON since 2026-07-16 (host plumbs the define unless R8I4_MMA_SRED=0;
+// RKI4_MMA_SRED: strength-reduced addressing for the G8 d128 mma page loop.
+// DEFAULT-ON since 2026-07-16 (host plumbs the define unless RKI4_MMA_SRED=0;
 // byte-gated + event-timed, ours_doc/SCORE_KERNEL_ISSUE_BOUND.md section 7).
-// Composes with R8I4_MMA_BIAS only; the CPA ring and the DEDUP tile carry
-// their own loop bodies and are separate A/B arms (set R8I4_MMA_SRED=0).
+// Composes with RKI4_MMA_BIAS only; the CPA ring and the DEDUP tile carry
+// their own loop bodies and are separate A/B arms (set RKI4_MMA_SRED=0).
 // (The STAGE and VCP staging arms were removed 2026-07-21; wave 3b also
 // removed WIDE2, PTRX and V8. Mechanisms and verdicts live in
 // ours_doc/REFUTED_ARMS_INDEX.md; recover from tag pre-cleanup-2026-07-21.)
 
-// R8I4_MMA_AOS: single record per (row) replacing the six summary arrays:
+// RKI4_MMA_AOS: single record per (row) replacing the six summary arrays:
 // [v4 512 | mu 128 | c8 8*PGT | cs 2*PGT | vs 16 | mus 2 | pad], 64B-aligned
 // (p16: 832B). STRUCTURAL escape from the measured 64-reg/8-CTA equilibrium:
 // ONE pointer + ONE stride frees the ~10 pointer registers (9 CTAs become
 // reachable WITHOUT launch_bounds or spill) and each page's bytes are one
 // contiguous L2-friendly block. Same bytes at new addresses -> bitwise gate.
 // Host entry: r8score_aos (rec passed via the v4 kernel arg; dense only).
-#ifdef R8I4_MMA_AOS
-#if !defined(R8I4_MMA) || !defined(R8I4_MMA_SRED)
-#error "R8I4_MMA_AOS requires R8I4_MMA + R8I4_MMA_SRED"
+#ifdef RKI4_MMA_AOS
+#if !defined(RKI4_MMA) || !defined(RKI4_MMA_SRED)
+#error "RKI4_MMA_AOS requires RKI4_MMA + RKI4_MMA_SRED"
 #endif
-// R8I4_MMA_PFR: cp.async record ring; the staged bytes ARE the AOS record.
-#if defined(R8I4_MMA_PFR) && !defined(R8I4_MMA_AOS)
-#error "R8I4_MMA_PFR requires R8I4_MMA_AOS"
+// RKI4_MMA_PFR: cp.async record ring; the staged bytes ARE the AOS record.
+#if defined(RKI4_MMA_PFR) && !defined(RKI4_MMA_AOS)
+#error "RKI4_MMA_PFR requires RKI4_MMA_AOS"
 #endif
-// R8I4_MMA_MUC (doc 25): mu rides the mma's dead basis columns at RNK<8;
+// RKI4_MMA_MUC (doc 25): mu rides the mma's dead basis columns at RNK<8;
 // integer-exact vs the IDP chain -> bitwise. Stage 1 scope guard:
-#if defined(R8I4_MMA_MUC) && (RNK == 8 || !defined(R8I4_MMA_AOS) || !defined(R8I4_MMA_BIAS) || defined(R8I4_MMA_S1PROBE))
-#error "R8I4_MMA_MUC stage 1 covers RNK<8 AOS+BIAS builds only"
+#if defined(RKI4_MMA_MUC) && (RNK == 8 || !defined(RKI4_MMA_AOS) || !defined(RKI4_MMA_BIAS) || defined(RKI4_MMA_S1PROBE))
+#error "RKI4_MMA_MUC stage 1 covers RNK<8 AOS+BIAS builds only"
 #endif
 // ALLG (general tensor-core projection, G in {4, 8}): scoped to the AOS+BIAS
 // build (the six-slab loop stays G8-flagship). MUC is excluded: mu rides the
@@ -225,24 +225,24 @@ __device__ __forceinline__ unsigned r8_hi(unsigned w) {
 // (and PK2 wants those columns for page packing). FOLDR is excluded in v1:
 // its epilogue publishes the b-octet fold rows unconditionally (G4 models cap
 // at 128K ctx; FOLDR is a >=512K arm, so nothing in the zoo needs the combo).
-#if defined(R8I4_MMA_ALLG) && (!defined(R8I4_MMA_AOS) || !defined(R8I4_MMA_BIAS))
-#error "R8I4_MMA_ALLG requires the R8I4_MMA_AOS + R8I4_MMA_BIAS build"
+#if defined(RKI4_MMA_ALLG) && (!defined(RKI4_MMA_AOS) || !defined(RKI4_MMA_BIAS))
+#error "RKI4_MMA_ALLG requires the RKI4_MMA_AOS + RKI4_MMA_BIAS build"
 #endif
-#if defined(R8I4_MMA_ALLG) && defined(R8I4_MMA_MUC)
-#error "R8I4_MMA_ALLG excludes R8I4_MMA_MUC (set LOCKS_R8I4_MUC=0)"
+#if defined(RKI4_MMA_ALLG) && defined(RKI4_MMA_MUC)
+#error "RKI4_MMA_ALLG excludes RKI4_MMA_MUC (set LOCKS_RKI4_MUC=0)"
 #endif
-#if defined(R8I4_MMA_ALLG) && defined(R8I4_MMA_FOLDR)
-#error "R8I4_MMA_ALLG v1 excludes R8I4_MMA_FOLDR (b-octet fold rows)"
+#if defined(RKI4_MMA_ALLG) && defined(RKI4_MMA_FOLDR)
+#error "RKI4_MMA_ALLG v1 excludes RKI4_MMA_FOLDR (b-octet fold rows)"
 #endif
-// R8I4_MMA_SCREEN (doc 26): certified-screen kernel. Needs the AOS record
+// RKI4_MMA_SCREEN (doc 26): certified-screen kernel. Needs the AOS record
 // (+ the nrmC pad field) and the BIAS int-mma; FLAT-domain semantics.
-#if defined(R8I4_MMA_SCREEN) && (!defined(R8I4_MMA_AOS) || !defined(R8I4_MMA_BIAS))
-#error "R8I4_MMA_SCREEN requires R8I4_MMA_AOS + R8I4_MMA_BIAS"
+#if defined(RKI4_MMA_SCREEN) && (!defined(RKI4_MMA_AOS) || !defined(RKI4_MMA_BIAS))
+#error "RKI4_MMA_SCREEN requires RKI4_MMA_AOS + RKI4_MMA_BIAS"
 #endif
-// R8I4_MMA_FOLDR (doc 27d, red-team-approved): in-register pmax fold at the
+// RKI4_MMA_FOLDR (doc 27d, red-team-approved): in-register pmax fold at the
 // S-write site; FLAT+AOS only, excludes the refuted/probe loop arms.
-#if defined(R8I4_MMA_FOLDR) && (!defined(R8I4_MMA_FLAT) || !defined(R8I4_MMA_AOS) || defined(R8I4_MMA_S1PROBE) || defined(R8I4_CP_NODT) || defined(R8I4_CP_NOEXP))
-#error "R8I4_MMA_FOLDR requires FLAT+AOS; excludes probe arms"
+#if defined(RKI4_MMA_FOLDR) && (!defined(RKI4_MMA_FLAT) || !defined(RKI4_MMA_AOS) || defined(RKI4_MMA_S1PROBE) || defined(RKI4_CP_NODT) || defined(RKI4_CP_NOEXP))
+#error "RKI4_MMA_FOLDR requires FLAT+AOS; excludes probe arms"
 #endif
 #endif
 
@@ -255,7 +255,7 @@ __device__ __forceinline__ unsigned r8_hi(unsigned w) {
 // path for G > 4 -- template specialization, not a runtime fallback.
 // OCCUPANCY (L4, measured): the flagship page-16 G4 d=128 kernel is
 // register/occupancy-bound at 16K+ (the 3-deep pipeline REGRESSED,
-// register-bound; ours_doc/R8I4_KERNELS.md L1 NEG).  A min-blocks=6 launch
+// register-bound; ours_doc/RKI4_KERNELS.md L1 NEG).  A min-blocks=6 launch
 // bound trades a few registers for one extra resident CTA/SM -> a
 // bitwise-safe ~5% score win (16K 10.76 -> 10.23us, 64K 29.5 -> 28.4) with
 // NO result change (launch_bounds is math-invariant, G1 re-certified).
@@ -264,30 +264,30 @@ __device__ __forceinline__ unsigned r8_hi(unsigned w) {
 // 6 REGRESSED it (measured p32 128K 30.6 -> 32.9), so PGT==16 is the exact
 // guard.  Every other geometry keeps min-blocks=0 (unconstrained), so it is
 // byte- AND perf-identical there.
-#define R8I4_G8_MINBLK 0
+#define RKI4_G8_MINBLK 0
 // CO-KERNEL SEAM (P2b, 2026-07-20): the DEPLOYED build (no define)
 // compiles the original __global__ kernel VERBATIM -- byte-identical
 // binary (gate: cuobjdump REG/SMEM anchor under the deployed -D set,
-// R8I4_MMA=1).  A co-kernel TU compiles this same source with
-// -DR8I4_DEVICE_BODY: the head becomes a __device__ function
-// (r8i4_score_dev) callable from a fat dispatcher kernel that runs the
+// RKI4_MMA=1).  A co-kernel TU compiles this same source with
+// -DRKI4_DEVICE_BODY: the head becomes a __device__ function
+// (rki4_score_dev) callable from a fat dispatcher kernel that runs the
 // score CONCURRENTLY with independent work (no streams, no events, no
 // barriers -- the halves share nothing).
-#ifdef R8I4_DEVICE_BODY
+#ifdef RKI4_DEVICE_BODY
 // __device__ form: grid coordinates become parameters (co_r/co_kh/co_z =
 // the logical (blockIdx.x, .y, .z); co_gz = the logical gridDim.z) -- the
 // co-kernel TU string-replaces the body's blockIdx/gridDim reads with
 // these names in ITS COPY of the source; the deployed text is untouched.
 template <int PGT, int DHEAD, bool BT, bool G4, bool G8 = false, bool PF = false>
 __device__ __noinline__
-void r8i4_score_dev(
+void rki4_score_dev(
     const int co_r, const int co_kh, const int co_z, const int co_gz,
     const int co_gy,
 #else
 template <int PGT, int DHEAD, bool BT, bool G4, bool G8 = false, bool PF = false>
 __global__ __launch_bounds__(TB, (G4 && DHEAD == 128 && PGT == 16) ? 6
-                                 : R8I4_G8_MINBLK)
-void r8i4_score_kernel(
+                                 : RKI4_G8_MINBLK)
+void rki4_score_kernel(
 #endif
     const __nv_bfloat16* __restrict__ q,   // (R, n_kv * G, d)
     const uint8_t* __restrict__ v4,        // dense (n_kv, P, RNK, d/2)
@@ -329,8 +329,8 @@ void r8i4_score_kernel(
     // REGRESSED (regs 96->125 -> occupancy 28->18% -> less total MLP: score
     // 94->127us @256K). The register-free MLP path (cp.async staging) is used
     // instead (below). So PIPE stays G4-only.
-#ifdef R8I4_MMA
-#ifdef R8I4_MMA_ALLG
+#ifdef RKI4_MMA
+#ifdef RKI4_MMA_ALLG
     // ALLG (rank campaign v2, 2026-07-26): the int8 tensor-core projection for
     // EVERY GQA group size at d128, not just the G8 flagship -- G<8 models
     // (Llama/Qwen G4 class) ride the same m16n8k32 chain with the dead A rows
@@ -353,9 +353,9 @@ void r8i4_score_kernel(
     // atomic latency, measured invariant to fence/barrier structure).
     // Folded: the SRED non-STAGE non-AOS mma loop (deployed scorer), the
     // !SRED shipped loop BOTH variants (the co TU compiles this one -- its
-    // build mirrors only R8I4_MMA), and the dp4a G8 kill-switch path; every
+    // build mirrors only RKI4_MMA), and the dp4a G8 kill-switch path; every
     // other arm keeps the re-scan (correct for all).
-#ifndef R8I4_MMA_AOS
+#ifndef RKI4_MMA_AOS
     constexpr bool HM_FOLD_MMA = true;
 #else
     constexpr bool HM_FOLD_MMA = false;
@@ -466,7 +466,7 @@ void r8i4_score_kernel(
     }
     __syncthreads();
 
-#ifdef R8I4_MMA
+#ifdef RKI4_MMA
     // Hoisted A fragments = the query in int8 (CONSTANT across pages). Lane map
     // for the mma: gidm = lane>>2 = head (M-row), t4m = lane&3 = K-offset.
     // Even-d limb (K 0-63) uses q8e words {t4m,4+t4m,8+t4m,12+t4m}, odd-d limb
@@ -484,7 +484,7 @@ void r8i4_score_kernel(
         Af[2][2] = q8o[gidm][4 + t4m];  Af[2][3] = 0u;
         Af[3][0] = q8o[gidm][8 + t4m];  Af[3][1] = 0u;
         Af[3][2] = q8o[gidm][12 + t4m]; Af[3][3] = 0u;
-#ifdef R8I4_MMA_ALLG
+#ifdef RKI4_MMA_ALLG
         // ALLG: heads >= G have UNINITIALIZED q8e/q8o rows (staging loops run
         // gg < G only). Zero their A fragments so the dead C rows are exact
         // zeros, not garbage. Compiled ONLY into the G4-template instantiation
@@ -496,7 +496,7 @@ void r8i4_score_kernel(
             }
         }
 #endif
-#ifdef R8I4_MMA_BIAS
+#ifdef RKI4_MMA_BIAS
         // Biased-nibble mma: feed the raw nibble (V+8) to drop the 8 __vsub4/
         // page (ALU), fold the +8 plane out exactly in the epilogue via
         // C = C' - 8*qsum, qsum = sum over all 128 d of q_int8[head] (hoisted,
@@ -507,7 +507,7 @@ void r8i4_score_kernel(
         qsum_mma += __shfl_xor_sync(~0u, qsum_mma, 1);
         qsum_mma += __shfl_xor_sync(~0u, qsum_mma, 2);
         qsum_mma *= 8;                              // pre-scale the fold-out
-#ifdef R8I4_MMA_ALLG
+#ifdef RKI4_MMA_ALLG
         // ALLG: q8d rows >= G are uninitialized -> force the dead heads'
         // fold-out to 0 (their acc rows are exact 0 from the zeroed A frags,
         // and 0 - 0 keeps the dead qt slots exactly 0). G4-template only.
@@ -517,7 +517,7 @@ void r8i4_score_kernel(
     }
 #endif
 
-#ifdef R8I4_MMA_FOLDR
+#ifdef RKI4_MMA_FOLDR
     float fold_a = -CUDART_INF_F, fold_b = -CUDART_INF_F;
 #endif
     const long pb_v = (long)kh * (long)P_dense;    // dense: page-major/head
@@ -530,14 +530,14 @@ void r8i4_score_kernel(
                          __nv_bfloat16& sv, __nv_bfloat16& smu,
                          __nv_bfloat16* sc) {
         const long row = row_of(pp);
-#ifdef R8I4_MMA_AOS
+#ifdef RKI4_MMA_AOS
         // ---- G4 (non-MMA) AOS record reader ---------------------------- //
         // The six summary components live in ONE 64B-aligned record per
         // (page, kv-head); the AOS launch passes ONLY that record (via v4)
         // and nullptr for vs/c8/cs/mu8/mus, so the six-array reads below
         // (the #else) faulted.  Read every field from the record at the
         // compile-time RO_* offsets (mirroring the G8 mma loop / the
-        // r8i4_state layout) with a per-lane stride that stays naturally
+        // rki4_state layout) with a per-lane stride that stays naturally
         // aligned AND in-bounds for RNK in {2, 4, 8}: the pre-AOS uint2 C
         // read was BOTH null and (at RNK<8, whose token stride is RNK<8
         // bytes) misaligned.  The basis columns exist only for rr < RNK, so
@@ -744,7 +744,7 @@ void r8i4_score_kernel(
     };
     int p = wid;
     if constexpr (USE_MMA) {
-#ifdef R8I4_MMA
+#ifdef RKI4_MMA
         // ----- int8 tensor-core projection loop (G8 d128 flagship) --------- //
         // Per page: (1) load this lane's mu/C/cs (rr=lane&7, for phase-1b + the
         // token reconstruction), (2) mma the whole GQA-group projection into
@@ -754,7 +754,7 @@ void r8i4_score_kernel(
         const int gidm = lane >> 2, t4m = lane & 3;   // mma lane map (proj)
         uint32_t mm[MUW]; uint2 cc[PGT / 8];
         __nv_bfloat16 smu, sc[PGT / 8];
-#ifdef R8I4_MMA_SRED
+#ifdef RKI4_MMA_SRED
         // SRED (strength-reduced addressing): dense rows advance by EXACTLY
         // nworker per iteration (row = pb_v + pp), so every summary pointer
         // advances by a constant byte stride, and the S store slot advances
@@ -781,7 +781,7 @@ void r8i4_score_kernel(
         const uint32_t* q8d_b = &q8d[gl + BOFF][rr * MUW];
         const float qsc_m = qsc[gidm];
         const float qsc_a = qsc[gl], qsc_b = qsc[gl + BOFF];
-#ifdef R8I4_MMA_FLAT
+#ifdef RKI4_MMA_FLAT
         // FLAT (doc 18): per-head shift constants for the mass exps.
         // (BOFF clamps the b-read at the G4-template; b is elided there.)
         const float K_a = Kflat[kh * G + gl], K_b = Kflat[kh * G + gl + BOFF];
@@ -809,7 +809,7 @@ void r8i4_score_kernel(
         // per-lane pointers (same addresses, same values).
         auto tile = [&](const float* qtg, const uint32_t* q8dg,
                         const float qscg, float* Sp, const float Kg) {
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             // MUC: md arrives via the mu mma column (integer-exact twin of
             // the IDP chain), broadcast through the dead qt slot.
             const float mud = qtg[RNK] * qscg * __bfloat162float(smu);
@@ -824,7 +824,7 @@ void r8i4_score_kernel(
             md += __shfl_xor_sync(~0u, md, 4);
             const float mud = md * qscg * __bfloat162float(smu);
 #endif
-#ifdef R8I4_MMA_FLAT
+#ifdef RKI4_MMA_FLAT
             // FLAT-MASS (doc 18): mass = sum_t exp(l_t - Kg). No per-page
             // max pass, no rescale chain, no log; Kg validity is guarded
             // select-side via pmax finiteness. tokv math is VERBATIM the
@@ -832,7 +832,7 @@ void r8i4_score_kernel(
             float esf = 0.f;
             #pragma unroll
             for (int tt = 0; tt < PGT / 8; ++tt) {
-#ifdef R8I4_CP_NODT
+#ifdef RKI4_CP_NODT
                 // CRITICAL-PATH PROBE (timing-only): kill the 8-FMA
                 // reconstruct chain; one dependent op keeps the cc load live.
                 float dt = (float)(int)cc[tt].x + qtg[0];
@@ -851,7 +851,7 @@ void r8i4_score_kernel(
 #endif
                 const float tok = sm_scale * (dt * __bfloat162float(sc[tt])
                     + mud);
-#ifdef R8I4_CP_NOEXP
+#ifdef RKI4_CP_NOEXP
                 // CRITICAL-PATH PROBE (timing-only, doc 19 pre-check):
                 // exp -> add; keeps the tok dependence, removes the XU op.
                 esf += (tok - Kg);
@@ -867,7 +867,7 @@ void r8i4_score_kernel(
             // per-group max in a plain SSA register (red-team ruling: no
             // captured-pointer accumulators -- a removed-arm precedent, see REFUTED_ARMS_INDEX.md).
             return esf;
-#elif defined(R8I4_MMA_LSE2)
+#elif defined(RKI4_MMA_LSE2)
             // Two-pass LSE: pass 1 = pure max (FMNMX only), pass 2 = ONE exp
             // per token + plain butterfly sum. Drops the online-rescale exps
             // (16 -> 4 EX2/page) and the serial es-rescale FMUL/FFMA chains
@@ -927,7 +927,7 @@ void r8i4_score_kernel(
 #endif
                 const float tok = sm_scale * (dt * __bfloat162float(sc[tt])
                     + mud);
-#ifdef R8I4_MMA_PEEL
+#ifdef RKI4_MMA_PEEL
                 // Peel tt=0: from (mx=-inf, es=0) the update is EXACTLY
                 // mx=tok, es = 0*expf(-inf)+expf(0) = 1.0 (each step exact
                 // in fp32) -> skip 2 exps/tile. Resolved at compile time by
@@ -955,15 +955,15 @@ void r8i4_score_kernel(
                 if (rr == 0) *Sp = osv;
                 return osv;
             }
-#endif  // R8I4_MMA_LSE2
+#endif  // RKI4_MMA_LSE2
         };
-#ifdef R8I4_MMA_AOS
+#ifdef RKI4_MMA_AOS
         // AOS record loop: identical bytes, identical float order; only the
         // ADDRESSES change (one record base + compile-time field offsets).
         {
         constexpr int  RO_MU  = RNK * (DHEAD / 2);
         // Field offsets + record size are FORMULAS of (RNK, DHEAD, PGT),
-        // 64B-aligned; MUST mirror r8i4_state._rec_bytes_aos / the view
+        // 64B-aligned; MUST mirror rki4_state._rec_bytes_aos / the view
         // slicing (r8: 832B at p16 d128, r4: 512B, r2: 384B).
         constexpr int  RO_C8  = RO_MU + DHEAD;
         constexpr int  RO_CS  = RO_C8 + RNK * PGT;
@@ -978,7 +978,7 @@ void r8i4_score_kernel(
         // record slab (host passes NB via the dense-only P_dense slot);
         // every VALID row is untouched -> bitwise gates unaffected.
         const long rmax_rec = BT ? ((long)P_dense * n_kv - 1) : 0L;
-#ifdef R8I4_MMA_PFR
+#ifdef RKI4_MMA_PFR
         // PFR (2026-07-17, ncu at the z-wave operating point: long_scoreboard
         // 4.35 dominant, warps_active 44%): 2-deep cp.async ring of the FULL
         // record per (warp, slot). Every per-lane record read below hits smem
@@ -1014,7 +1014,7 @@ void r8i4_score_kernel(
                 &recring[warp][pslot][0]);
             // (1) mu / C / cs / mus from the staged record (plain smem loads;
             // same offsets and bytes as the global path)
-#ifndef R8I4_MMA_MUC
+#ifndef RKI4_MMA_MUC
             #pragma unroll
             for (int j = 0; j < MUW / 4; ++j) {
                 const uint4 m4 = *(reinterpret_cast<const uint4*>(
@@ -1042,7 +1042,7 @@ void r8i4_score_kernel(
             smu = *reinterpret_cast<const __nv_bfloat16*>(p_smem + RO_MUS);
             int acc[4] = {0, 0, 0, 0};
             unsigned b[2];
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const bool ismu = (gidm == RNK);
             const unsigned* cwp = reinterpret_cast<const unsigned*>(
                 p_smem + (ismu ? RO_MU : gidm * (DHEAD / 2)));
@@ -1052,14 +1052,14 @@ void r8i4_score_kernel(
 #endif
             const unsigned cw0 = cwp[t4m],      cw1 = cwp[4 + t4m],
                            cw2 = cwp[8 + t4m],  cw3 = cwp[12 + t4m];
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const unsigned cm4 = ismu ? cwp[16 + t4m] : 0u,
                            cm5 = ismu ? cwp[20 + t4m] : 0u,
                            cm6 = ismu ? cwp[24 + t4m] : 0u,
                            cm7 = ismu ? cwp[28 + t4m] : 0u;
 #endif
-#ifdef R8I4_MMA_BIAS
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_BIAS
+#ifdef RKI4_MMA_MUC
             b[0] = ismu ? cw0 : ((cw0 & 0x0F0F0F0Fu) ^ 0x08080808u);
             b[1] = ismu ? cw1 : ((cw1 & 0x0F0F0F0Fu) ^ 0x08080808u); r8_mma_s8(acc, Af[0], b);
             b[0] = ismu ? cw2 : ((cw2 & 0x0F0F0F0Fu) ^ 0x08080808u);
@@ -1081,7 +1081,7 @@ void r8i4_score_kernel(
 #if RNK == 8
             const int c0 = acc[0] - qsum_mma, c1 = acc[1] - qsum_mma;
 #else
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const int c0 = (2 * t4m + 0 < RNK) ? acc[0] - qsum_mma
                            : (2 * t4m + 0 == RNK ? acc[0] : 0);
             const int c1 = (2 * t4m + 1 < RNK) ? acc[1] - qsum_mma
@@ -1103,7 +1103,7 @@ void r8i4_score_kernel(
             const int c1 = (2 * t4m + 1 < RNK) ? acc[1] : 0;
 #endif
 #endif
-#ifdef R8I4_MMA_S1PROBE
+#ifdef RKI4_MMA_S1PROBE
             // TIMING PROBE ONLY (two-stage split S1 floor): store the raw
             // int32 mma coefficients instead of running LSE/tiles. Output is
             // NOT score_h semantics -- never gate, never ship; the probe
@@ -1115,7 +1115,7 @@ void r8i4_score_kernel(
 #else
             const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(
                 p_smem + RO_VS + 4 * t4m);
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             qtw[0] = (2 * t4m + 0 == RNK) ? (float)c0
                      : (float)c0 * qsc_m * __bfloat162float(sv2.x);
             qtw[1] = (2 * t4m + 1 == RNK) ? (float)c1
@@ -1125,7 +1125,7 @@ void r8i4_score_kernel(
             qtw[1] = (float)c1 * qsc_m * __bfloat162float(sv2.y);
 #endif
             __syncwarp();
-#ifdef R8I4_MMA_FOLDR
+#ifdef RKI4_MMA_FOLDR
             fold_a = fmaxf(fold_a, tile(qt_a, q8d_a, qsc_a, Sp_a, K_a));
             if constexpr (G8)
                 fold_b = fmaxf(fold_b, tile(qt_b, q8d_b, qsc_b, Sp_b, K_b));
@@ -1135,7 +1135,7 @@ void r8i4_score_kernel(
                 tile(qt_b, q8d_b, qsc_b, Sp_b, K_b);
 #endif
             issue_rec(pp + 2 * nworker, pslot);
-#endif  // R8I4_MMA_S1PROBE
+#endif  // RKI4_MMA_S1PROBE
             pslot ^= 1;
             Sp_a += nworker; Sp_b += nworker;
             __syncwarp();      // qt_sh reuse next page
@@ -1150,7 +1150,7 @@ void r8i4_score_kernel(
                 p_rec = v4 + rowb * RECB;
             }
             // (1) mu / C / cs / mus from the record
-#ifndef R8I4_MMA_MUC
+#ifndef RKI4_MMA_MUC
             #pragma unroll
             for (int j = 0; j < MUW / 4; ++j) {
                 const uint4 m4 = __ldg(reinterpret_cast<const uint4*>(
@@ -1179,7 +1179,7 @@ void r8i4_score_kernel(
             // (2) mma projection from the record's basis block
             int acc[4] = {0, 0, 0, 0};
             unsigned b[2];
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const bool ismu = (gidm == RNK);
             const unsigned* cwp = reinterpret_cast<const unsigned*>(
                 p_rec + (ismu ? RO_MU : gidm * (DHEAD / 2)));
@@ -1189,14 +1189,14 @@ void r8i4_score_kernel(
 #endif
             const unsigned cw0 = __ldg(cwp + t4m),      cw1 = __ldg(cwp + 4 + t4m),
                            cw2 = __ldg(cwp + 8 + t4m),  cw3 = __ldg(cwp + 12 + t4m);
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const unsigned cm4 = ismu ? __ldg(cwp + 16 + t4m) : 0u,
                            cm5 = ismu ? __ldg(cwp + 20 + t4m) : 0u,
                            cm6 = ismu ? __ldg(cwp + 24 + t4m) : 0u,
                            cm7 = ismu ? __ldg(cwp + 28 + t4m) : 0u;
 #endif
-#ifdef R8I4_MMA_BIAS
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_BIAS
+#ifdef RKI4_MMA_MUC
             b[0] = ismu ? cw0 : ((cw0 & 0x0F0F0F0Fu) ^ 0x08080808u);
             b[1] = ismu ? cw1 : ((cw1 & 0x0F0F0F0Fu) ^ 0x08080808u); r8_mma_s8(acc, Af[0], b);
             b[0] = ismu ? cw2 : ((cw2 & 0x0F0F0F0Fu) ^ 0x08080808u);
@@ -1218,7 +1218,7 @@ void r8i4_score_kernel(
 #if RNK == 8
             const int c0 = acc[0] - qsum_mma, c1 = acc[1] - qsum_mma;
 #else
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const int c0 = (2 * t4m + 0 < RNK) ? acc[0] - qsum_mma
                            : (2 * t4m + 0 == RNK ? acc[0] : 0);
             const int c1 = (2 * t4m + 1 < RNK) ? acc[1] - qsum_mma
@@ -1242,7 +1242,7 @@ void r8i4_score_kernel(
 #endif
             const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(
                 p_rec + RO_VS + 4 * t4m);
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             qtw[0] = (2 * t4m + 0 == RNK) ? (float)c0
                      : (float)c0 * qsc_m * __bfloat162float(sv2.x);
             qtw[1] = (2 * t4m + 1 == RNK) ? (float)c1
@@ -1253,7 +1253,7 @@ void r8i4_score_kernel(
 #endif
             __syncwarp();
             // (3) tiles (identical)
-#ifdef R8I4_MMA_FOLDR
+#ifdef RKI4_MMA_FOLDR
             fold_a = fmaxf(fold_a, tile(qt_a, q8d_a, qsc_a, Sp_a, K_a));
             if constexpr (G8)
                 fold_b = fmaxf(fold_b, tile(qt_b, q8d_b, qsc_b, Sp_b, K_b));
@@ -1266,9 +1266,9 @@ void r8i4_score_kernel(
             Sp_a += nworker; Sp_b += nworker;
             __syncwarp();      // qt_sh reuse next page
         }
-#endif  // R8I4_MMA_PFR
+#endif  // RKI4_MMA_PFR
         }
-#else   // !R8I4_MMA_AOS: six-array addressing
+#else   // !RKI4_MMA_AOS: six-array addressing
         // ---- Fix 1: depth-1 software pipeline of the dominant v4 load ----- //
         // ncu (DEPLOYED kernel, 256K/bs4): long_scoreboard 6.22 (~4x the next
         // stall), issue_active 63%, DRAM 27% SOL, occupancy 47% @ 1 wave,
@@ -1397,8 +1397,8 @@ void r8i4_score_kernel(
 #endif
                 int acc[4] = {0, 0, 0, 0};
                 unsigned b[2];
-#ifdef R8I4_MMA_BIAS
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_BIAS
+#ifdef RKI4_MMA_MUC
                 b[0] = ismu ? cw0 : ((cw0 & 0x0F0F0F0Fu) ^ 0x08080808u);
                 b[1] = ismu ? cw1 : ((cw1 & 0x0F0F0F0Fu) ^ 0x08080808u); r8_mma_s8(acc, A0, b);
                 b[0] = ismu ? cw2 : ((cw2 & 0x0F0F0F0Fu) ^ 0x08080808u);
@@ -1420,7 +1420,7 @@ void r8i4_score_kernel(
 #if RNK == 8
                 const int c0 = acc[0] - qsum_mma, c1 = acc[1] - qsum_mma;
 #else
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
                 const int c0 = (2 * t4m + 0 < RNK) ? acc[0] - qsum_mma
                                : (2 * t4m + 0 == RNK ? acc[0] : 0);
                 const int c1 = (2 * t4m + 1 < RNK) ? acc[1] - qsum_mma
@@ -1443,7 +1443,7 @@ void r8i4_score_kernel(
 #endif
 #endif
                 const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(p_vs);
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
                 qtw[0] = (2 * t4m + 0 == RNK) ? (float)c0
                          : (float)c0 * qsc_m * __bfloat162float(sv2.x);
                 qtw[1] = (2 * t4m + 1 == RNK) ? (float)c1
@@ -1506,8 +1506,8 @@ void r8i4_score_kernel(
                            cw2 = __ldg(p_v4 + 8),  cw3 = __ldg(p_v4 + 12);
             int acc[4] = {0, 0, 0, 0};
             unsigned b[2];
-#ifdef R8I4_MMA_BIAS
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_BIAS
+#ifdef RKI4_MMA_MUC
             b[0] = ismu ? cw0 : ((cw0 & 0x0F0F0F0Fu) ^ 0x08080808u);
             b[1] = ismu ? cw1 : ((cw1 & 0x0F0F0F0Fu) ^ 0x08080808u); r8_mma_s8(acc, Af[0], b);
             b[0] = ismu ? cw2 : ((cw2 & 0x0F0F0F0Fu) ^ 0x08080808u);
@@ -1529,7 +1529,7 @@ void r8i4_score_kernel(
 #if RNK == 8
             const int c0 = acc[0] - qsum_mma, c1 = acc[1] - qsum_mma;
 #else
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const int c0 = (2 * t4m + 0 < RNK) ? acc[0] - qsum_mma
                            : (2 * t4m + 0 == RNK ? acc[0] : 0);
             const int c1 = (2 * t4m + 1 < RNK) ? acc[1] - qsum_mma
@@ -1552,7 +1552,7 @@ void r8i4_score_kernel(
 #endif
 #endif
             const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(p_vs);
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             qtw[0] = (2 * t4m + 0 == RNK) ? (float)c0
                      : (float)c0 * qsc_m * __bfloat162float(sv2.x);
             qtw[1] = (2 * t4m + 1 == RNK) ? (float)c1
@@ -1583,8 +1583,8 @@ void r8i4_score_kernel(
             __syncwarp();      // qt_sh reuse next page
         }
         }   // end !BT / PGT!=16 original six-array loop (else of Fix 1)
-#endif  // R8I4_MMA_AOS
-#else   // !R8I4_MMA_SRED: the shipped per-page addressing loop
+#endif  // RKI4_MMA_AOS
+#else   // !RKI4_MMA_SRED: the shipped per-page addressing loop
         for (int pp = wid; pp < P; pp += nworker) {
             const long row = row_of(pp);
             // (1) per-(lane=rr) mu / C / cs / mus loads (d128 -> MUW=4)
@@ -1620,7 +1620,7 @@ void r8i4_score_kernel(
                      * (DHEAD / 2));                       // basis column gidm
             const unsigned cw0 = __ldg(cwp + t4m),      cw1 = __ldg(cwp + 4 + t4m),
                            cw2 = __ldg(cwp + 8 + t4m),  cw3 = __ldg(cwp + 12 + t4m);
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const unsigned cm4 = ismu ? __ldg(cwp + 16 + t4m) : 0u,
                            cm5 = ismu ? __ldg(cwp + 20 + t4m) : 0u,
                            cm6 = ismu ? __ldg(cwp + 24 + t4m) : 0u,
@@ -1628,12 +1628,12 @@ void r8i4_score_kernel(
 #endif
             int acc[4] = {0, 0, 0, 0};
             unsigned b[2];
-#ifdef R8I4_MMA_BIAS
+#ifdef RKI4_MMA_BIAS
             // Biased nibble b'' = (nib ^ 8) = V + 8 (the int4 is two's-complement,
             // so V = (nib^8) - 8). One LOP3 (AND+XOR fused) per limb, DROPPING
             // the __vsub4 vs r8_lo/r8_hi (-8 ALU/page). The +8 plane folds out
             // exactly: C = C'' - 8*qsum (qsum_mma already carries the *8).
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             b[0] = ismu ? cw0 : ((cw0 & 0x0F0F0F0Fu) ^ 0x08080808u);
             b[1] = ismu ? cw1 : ((cw1 & 0x0F0F0F0Fu) ^ 0x08080808u); r8_mma_s8(acc, Af[0], b);
             b[0] = ismu ? cw2 : ((cw2 & 0x0F0F0F0Fu) ^ 0x08080808u);
@@ -1655,7 +1655,7 @@ void r8i4_score_kernel(
 #if RNK == 8
             const int c0 = acc[0] - qsum_mma, c1 = acc[1] - qsum_mma;
 #else
-#ifdef R8I4_MMA_MUC
+#ifdef RKI4_MMA_MUC
             const int c0 = (2 * t4m + 0 < RNK) ? acc[0] - qsum_mma
                            : (2 * t4m + 0 == RNK ? acc[0] : 0);
             const int c1 = (2 * t4m + 1 < RNK) ? acc[1] - qsum_mma
@@ -1741,7 +1741,7 @@ void r8i4_score_kernel(
             }
             __syncwarp();      // qt_sh reuse next page
         }
-#endif  // R8I4_MMA_SRED (else = shipped per-page addressing loop)
+#endif  // RKI4_MMA_SRED (else = shipped per-page addressing loop)
 #endif
     } else if constexpr (PIPE) {
         // 2-deep software pipeline: issue page p+1's loads into a register
@@ -1794,7 +1794,7 @@ void r8i4_score_kernel(
              i += (int)gridDim.z * (int)blockDim.x)
             ghist_out[(long)fgroup * 256 + i] = 0;
         __shared__ float foldm[NW][8];
-#ifdef R8I4_MMA_FOLDR
+#ifdef RKI4_MMA_FOLDR
         if constexpr (USE_MMA) {
             // FOLDR (doc 27d): the per-group maxima were folded in registers
             // at the S-write sites; publish the warp's two group slots and
@@ -1925,12 +1925,12 @@ static KFn pick_kernel(int PGT, int DHEAD, bool bt_mode, bool g4, bool g8,
     // regimes where it strictly wins. Every other geometry/regime falls through
     // to PF=false (the byte-identical deployed loop) below.
     if (pf && bt_mode && g8 && PGT == 16 && DHEAD == 128)
-        return r8i4_score_kernel<16, 128, true, false, true, /*PF=*/true>;
-#define R8I4_CASE(PGT_, DH_) if (PGT == PGT_ && DHEAD == DH_) { if (bt_mode) { if (g4) return r8i4_score_kernel<PGT_, DH_, true, true, false>; if (g8) return r8i4_score_kernel<PGT_, DH_, true, false, true>; return r8i4_score_kernel<PGT_, DH_, true, false, false>; } if (g4) return r8i4_score_kernel<PGT_, DH_, false, true, false>; if (g8) return r8i4_score_kernel<PGT_, DH_, false, false, true>; return r8i4_score_kernel<PGT_, DH_, false, false, false>; }
-    R8I4_CASE(16, 64) R8I4_CASE(16, 128) R8I4_CASE(16, 256)
-    R8I4_CASE(32, 64) R8I4_CASE(32, 128) R8I4_CASE(32, 256)
-#undef R8I4_CASE
-    TORCH_CHECK(false, "r8i4: unsupported geometry page=", PGT,
+        return rki4_score_kernel<16, 128, true, false, true, /*PF=*/true>;
+#define RKI4_CASE(PGT_, DH_) if (PGT == PGT_ && DHEAD == DH_) { if (bt_mode) { if (g4) return rki4_score_kernel<PGT_, DH_, true, true, false>; if (g8) return rki4_score_kernel<PGT_, DH_, true, false, true>; return rki4_score_kernel<PGT_, DH_, true, false, false>; } if (g4) return rki4_score_kernel<PGT_, DH_, false, true, false>; if (g8) return rki4_score_kernel<PGT_, DH_, false, false, true>; return rki4_score_kernel<PGT_, DH_, false, false, false>; }
+    RKI4_CASE(16, 64) RKI4_CASE(16, 128) RKI4_CASE(16, 256)
+    RKI4_CASE(32, 64) RKI4_CASE(32, 128) RKI4_CASE(32, 256)
+#undef RKI4_CASE
+    TORCH_CHECK(false, "rki4: unsupported geometry page=", PGT,
                 " d=", DHEAD, " (supported: page {16,32} x d {64,128,256})");
     return nullptr;
 }
@@ -1969,8 +1969,8 @@ void r8score(torch::Tensor q, torch::Tensor v4, torch::Tensor vs,
              torch::Tensor mus, torch::Tensor S, double sm_scale,
              int64_t zsplit)
 {
-#ifdef R8I4_MMA_FLAT
-    TORCH_CHECK(false, "R8I4_MMA_FLAT build: use r8i4_score_bt_aos_flat "
+#ifdef RKI4_MMA_FLAT
+    TORCH_CHECK(false, "RKI4_MMA_FLAT build: use rki4_score_bt_aos_flat "
                        "(base entries pass Kflat=nullptr)");
 #endif
 
@@ -2005,14 +2005,14 @@ void r8score(torch::Tensor q, torch::Tensor v4, torch::Tensor vs,
 void r8score_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor S,
                  double sm_scale, int64_t zsplit)
 {
-#ifdef R8I4_MMA_FLAT
-    TORCH_CHECK(false, "R8I4_MMA_FLAT build: use r8i4_score_bt_aos_flat "
+#ifdef RKI4_MMA_FLAT
+    TORCH_CHECK(false, "RKI4_MMA_FLAT build: use rki4_score_bt_aos_flat "
                        "(base entries pass Kflat=nullptr)");
 #endif
 
-#ifndef R8I4_MMA_AOS
+#ifndef RKI4_MMA_AOS
     (void)q; (void)rec; (void)S; (void)sm_scale; (void)zsplit;
-    TORCH_CHECK(false, "r8score_aos requires an R8I4_MMA_AOS build");
+    TORCH_CHECK(false, "r8score_aos requires an RKI4_MMA_AOS build");
 #else
     const int R = q.size(0);
     const int n_kv = rec.size(0);
@@ -2020,7 +2020,7 @@ void r8score_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor S,
     const int G = S.size(2);
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.stride(2) == 1, "q");
     TORCH_CHECK(rec.scalar_type() == torch::kUInt8 && rec.is_contiguous()
-                && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST,
+                && rec.dim() == 3 && rec.size(2) == RKI4_RECB_HOST,
                 "rec must be contiguous (n_kv, P, 832) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(0) == R && S.size(1) == n_kv && S.size(3) == P, "S");
@@ -2044,32 +2044,32 @@ void r8score_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor S,
 #endif
 }
 
-void r8i4_score_bt_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor bt,
+void rki4_score_bt_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor bt,
                        torch::Tensor nsh, torch::Tensor S, double sm_scale,
                        int64_t zsplit, int64_t n_req)
 {
-#ifdef R8I4_MMA_FLAT
-    TORCH_CHECK(false, "R8I4_MMA_FLAT build: use r8i4_score_bt_aos_flat "
+#ifdef RKI4_MMA_FLAT
+    TORCH_CHECK(false, "RKI4_MMA_FLAT build: use rki4_score_bt_aos_flat "
                        "(base entries pass Kflat=nullptr)");
 #endif
 
-#ifndef R8I4_MMA_AOS
+#ifndef RKI4_MMA_AOS
     (void)q; (void)rec; (void)bt; (void)nsh; (void)S; (void)sm_scale;
     (void)zsplit; (void)n_req;
-    TORCH_CHECK(false, "r8i4_score_bt_aos requires an R8I4_MMA_AOS build");
+    TORCH_CHECK(false, "rki4_score_bt_aos requires an RKI4_MMA_AOS build");
 #else
     const int n_kv = rec.size(1);
     const int G = S.size(2);
     const int MP = S.size(3);
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.stride(2) == 1, "q");
     TORCH_CHECK(rec.scalar_type() == torch::kUInt8 && rec.is_contiguous()
-                && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST,
+                && rec.dim() == 3 && rec.size(2) == RKI4_RECB_HOST,
                 "rec must be contiguous (NB, n_kv, 832) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
     TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
                 && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
-                "r8i4_score_bt_aos covers G in {4,8} d128 p16 records only");
+                "rki4_score_bt_aos covers G in {4,8} d128 p16 records only");
     TORCH_CHECK(bt.scalar_type() == torch::kInt && bt.stride(1) == 1,
                 "block table must be int32, row-contiguous");
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(),
@@ -2090,38 +2090,38 @@ void r8i4_score_bt_aos(torch::Tensor q, torch::Tensor rec, torch::Tensor bt,
         q.stride(0), q.stride(1), bt.stride(0), nullptr, nullptr, nullptr,
         nullptr, nullptr, nullptr, nullptr);
     cudaError_t e = cudaGetLastError();
-    TORCH_CHECK(e == cudaSuccess, "r8i4_score_bt_aos launch: ",
+    TORCH_CHECK(e == cudaSuccess, "rki4_score_bt_aos launch: ",
                 cudaGetErrorString(e));
 #endif
 }
 
-// PMAX FOLD variant: identical to r8i4_score_bt_aos plus the epilogue outputs
+// PMAX FOLD variant: identical to rki4_score_bt_aos plus the epilogue outputs
 // (per-CTA chunk maxima into gpmax at (group, 8, zsplit) and the pass-0 ghist
 // zeroing). Separate entry so every existing caller keeps its ABI; the base
 // entry passes nullptrs (the epilogue is dead code there).
-void r8i4_score_bt_aos_fold(torch::Tensor q, torch::Tensor rec,
+void rki4_score_bt_aos_fold(torch::Tensor q, torch::Tensor rec,
                             torch::Tensor bt, torch::Tensor nsh,
                             torch::Tensor S, torch::Tensor gpmax,
                             torch::Tensor ghist, double sm_scale,
                             int64_t zsplit, int64_t n_req)
 {
-#ifndef R8I4_MMA_AOS
+#ifndef RKI4_MMA_AOS
     (void)q; (void)rec; (void)bt; (void)nsh; (void)S; (void)gpmax;
     (void)ghist; (void)sm_scale; (void)zsplit; (void)n_req;
-    TORCH_CHECK(false, "r8i4_score_bt_aos_fold requires an R8I4_MMA_AOS build");
+    TORCH_CHECK(false, "rki4_score_bt_aos_fold requires an RKI4_MMA_AOS build");
 #else
     const int n_kv = rec.size(1);
     const int G = S.size(2);
     const int MP = S.size(3);
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.stride(2) == 1, "q");
     TORCH_CHECK(rec.scalar_type() == torch::kUInt8 && rec.is_contiguous()
-                && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST,
+                && rec.dim() == 3 && rec.size(2) == RKI4_RECB_HOST,
                 "rec must be contiguous (NB, n_kv, RECB) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
     TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
                 && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
-                "r8i4_score_bt_aos_fold covers G in {4,8} d128 p16 records only");
+                "rki4_score_bt_aos_fold covers G in {4,8} d128 p16 records only");
     TORCH_CHECK(bt.scalar_type() == torch::kInt && bt.stride(1) == 1,
                 "block table must be int32, row-contiguous");
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(),
@@ -2148,37 +2148,37 @@ void r8i4_score_bt_aos_fold(torch::Tensor q, torch::Tensor rec,
         gpmax.data_ptr<float>(), ghist.data_ptr<int>(), nullptr,
         nullptr, nullptr, nullptr, nullptr);
     cudaError_t e = cudaGetLastError();
-    TORCH_CHECK(e == cudaSuccess, "r8i4_score_bt_aos_fold launch: ",
+    TORCH_CHECK(e == cudaSuccess, "rki4_score_bt_aos_fold launch: ",
                 cudaGetErrorString(e));
 #endif
 }
 
-// FLAT-MASS entry (doc 18): identical checks/launch to r8i4_score_bt_aos
+// FLAT-MASS entry (doc 18): identical checks/launch to rki4_score_bt_aos
 // plus the per-(kh,g) shift tensor. Compiled meaningfully only under
-// R8I4_MMA_FLAT (otherwise the kernel ignores Kflat and computes LSE --
+// RKI4_MMA_FLAT (otherwise the kernel ignores Kflat and computes LSE --
 // callers must not route here without the flag; the python side gates).
-void r8i4_score_bt_aos_flat(torch::Tensor q, torch::Tensor rec,
+void rki4_score_bt_aos_flat(torch::Tensor q, torch::Tensor rec,
                             torch::Tensor bt, torch::Tensor nsh,
                             torch::Tensor S, torch::Tensor Kflat,
                             double sm_scale, int64_t zsplit, int64_t n_req)
 {
-#ifndef R8I4_MMA_AOS
+#ifndef RKI4_MMA_AOS
     (void)q; (void)rec; (void)bt; (void)nsh; (void)S; (void)Kflat;
     (void)sm_scale; (void)zsplit; (void)n_req;
-    TORCH_CHECK(false, "r8i4_score_bt_aos_flat requires an R8I4_MMA_AOS build");
+    TORCH_CHECK(false, "rki4_score_bt_aos_flat requires an RKI4_MMA_AOS build");
 #else
     const int n_kv = rec.size(1);
     const int G = S.size(2);
     const int MP = S.size(3);
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.stride(2) == 1, "q");
     TORCH_CHECK(rec.scalar_type() == torch::kUInt8 && rec.is_contiguous()
-                && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST,
+                && rec.dim() == 3 && rec.size(2) == RKI4_RECB_HOST,
                 "rec must be contiguous (NB, n_kv, RECB) uint8");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
     TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
                 && (G == 4 || G == 8) && (G != 8 || g8_enabled()),
-                "r8i4_score_bt_aos_flat covers G in {4,8} d128 p16 records only");
+                "rki4_score_bt_aos_flat covers G in {4,8} d128 p16 records only");
     TORCH_CHECK(bt.scalar_type() == torch::kInt && bt.stride(1) == 1,
                 "block table must be int32, row-contiguous");
     TORCH_CHECK(nsh.scalar_type() == torch::kInt && nsh.is_contiguous(),
@@ -2202,7 +2202,7 @@ void r8i4_score_bt_aos_flat(torch::Tensor q, torch::Tensor rec,
         nullptr, nullptr, Kflat.data_ptr<float>(),
         nullptr, nullptr, nullptr, nullptr);
     cudaError_t e = cudaGetLastError();
-    TORCH_CHECK(e == cudaSuccess, "r8i4_score_bt_aos_flat launch: ",
+    TORCH_CHECK(e == cudaSuccess, "rki4_score_bt_aos_flat launch: ",
                 cudaGetErrorString(e));
 #endif
 }
@@ -2212,24 +2212,24 @@ void r8i4_score_bt_aos_flat(torch::Tensor q, torch::Tensor rec,
 // the S values this launch wrote, so it is score-domain-agnostic; under
 // FLAT it emits per-chunk MASS maxima -- exactly what sel_pmax computed --
 // letting the select chain skip its 8.39MB score_h pass (pmax_done route).
-void r8i4_score_bt_aos_flat_fold(torch::Tensor q, torch::Tensor rec,
+void rki4_score_bt_aos_flat_fold(torch::Tensor q, torch::Tensor rec,
                                  torch::Tensor bt, torch::Tensor nsh,
                                  torch::Tensor S, torch::Tensor gpmax,
                                  torch::Tensor ghist, torch::Tensor Kflat,
                                  double sm_scale, int64_t zsplit,
                                  int64_t n_req)
 {
-#ifndef R8I4_MMA_FLAT
+#ifndef RKI4_MMA_FLAT
     (void)q; (void)rec; (void)bt; (void)nsh; (void)S; (void)gpmax;
     (void)ghist; (void)Kflat; (void)sm_scale; (void)zsplit; (void)n_req;
-    TORCH_CHECK(false, "flat_fold requires an R8I4_MMA_FLAT build");
+    TORCH_CHECK(false, "flat_fold requires an RKI4_MMA_FLAT build");
 #else
     const int n_kv = rec.size(1);
     const int G = S.size(2);
     const int MP = S.size(3);
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.stride(2) == 1, "q");
     TORCH_CHECK(rec.scalar_type() == torch::kUInt8 && rec.is_contiguous()
-                && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST, "rec");
+                && rec.dim() == 3 && rec.size(2) == RKI4_RECB_HOST, "rec");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat
                 && S.size(1) == n_kv, "S must be (R, n_kv, G, MP) fp32");
     TORCH_CHECK(q.size(1) == (long)n_kv * G && q.size(2) == 128
@@ -2265,7 +2265,7 @@ void r8i4_score_bt_aos_flat_fold(torch::Tensor q, torch::Tensor rec,
 #endif
 }
 
-void r8i4_score_bt(torch::Tensor q, torch::Tensor v4, torch::Tensor vs,
+void rki4_score_bt(torch::Tensor q, torch::Tensor v4, torch::Tensor vs,
                    torch::Tensor c8, torch::Tensor cs, torch::Tensor mu8,
                    torch::Tensor mus, torch::Tensor bt, torch::Tensor nsh,
                    torch::Tensor S, double sm_scale, int64_t zsplit,
@@ -2308,8 +2308,8 @@ void r8i4_score_bt(torch::Tensor q, torch::Tensor v4, torch::Tensor vs,
                     "norope: sl int32, csc (P,LOCKS_ROT_DIM) bf16 row-contig, "
                     "qout contiguous bf16");
     }
-#ifdef R8I4_MMA_FLAT
-    TORCH_CHECK(false, "R8I4_MMA_FLAT build: use r8i4_score_bt_aos_flat "
+#ifdef RKI4_MMA_FLAT
+    TORCH_CHECK(false, "RKI4_MMA_FLAT build: use rki4_score_bt_aos_flat "
                        "(base entries pass Kflat=nullptr)");
 #endif
 
@@ -2364,11 +2364,11 @@ void r8i4_score_bt(torch::Tensor q, torch::Tensor v4, torch::Tensor vs,
         q.stride(0), q.stride(1), bt.stride(0), nullptr, nullptr, nullptr,
         slp, cscp, qoutp, hmp);
     cudaError_t e = cudaGetLastError();
-    TORCH_CHECK(e == cudaSuccess, "r8i4_score_bt launch: ",
+    TORCH_CHECK(e == cudaSuccess, "rki4_score_bt launch: ",
                 cudaGetErrorString(e));
 }
 
-#ifdef R8I4_MMA_SCREEN
+#ifdef RKI4_MMA_SCREEN
 // ---------------------------------------------------------------------------
 // Certified-screen pass (doc 26).  Per (page, kv-head): the EXACT int-mma
 // q.V projection (verbatim BIAS chain), then dt for ALL 16 tokens x 8 heads
@@ -2393,7 +2393,7 @@ __device__ __forceinline__ void scr_hmma_bf16(float* d, const unsigned* a,
 
 template <int PGT, int DHEAD, bool BT>
 __global__ __launch_bounds__(TB)
-void r8i4_screen_kernel(
+void rki4_screen_kernel(
     const __nv_bfloat16* __restrict__ q,
     const uint8_t* __restrict__ v4,        // AOS records (BT: (NB,n_kv,RECB))
     const int* __restrict__ bt,
@@ -2671,7 +2671,7 @@ void r8i4_screen_kernel(
     cpasync_wait<0>();
 }
 
-void r8i4_score_bt_aos_screen(
+void rki4_score_bt_aos_screen(
     torch::Tensor q, torch::Tensor rec, torch::Tensor btt, torch::Tensor nsh,
     torch::Tensor S, torch::Tensor rad, torch::Tensor Kflat, double scale,
     int64_t zsplit, int64_t n_req) {
@@ -2680,7 +2680,7 @@ void r8i4_score_bt_aos_screen(
     const int MP = S.size(3);
     TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.stride(2) == 1, "q");
     TORCH_CHECK(rec.scalar_type() == torch::kUInt8 && rec.is_contiguous()
-                && rec.dim() == 3 && rec.size(2) == R8I4_RECB_HOST, "rec");
+                && rec.dim() == 3 && rec.size(2) == RKI4_RECB_HOST, "rec");
     TORCH_CHECK(S.is_contiguous() && S.scalar_type() == torch::kFloat, "S");
     TORCH_CHECK(rad.is_contiguous() && rad.scalar_type() == torch::kFloat
                 && rad.size(-1) == MP, "rad");
@@ -2690,7 +2690,7 @@ void r8i4_score_bt_aos_screen(
                 "screen covers the G8 d128 p16 flagship");
     dim3 grid(n_kv, (unsigned)n_req, (unsigned)zsplit);
     auto stream = at::cuda::getCurrentCUDAStream();
-    r8i4_screen_kernel<16, 128, true><<<grid, TB, 0, stream>>>(
+    rki4_screen_kernel<16, 128, true><<<grid, TB, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
         rec.data_ptr<uint8_t>(), btt.data_ptr<int>(), nsh.data_ptr<int>(),
         S.data_ptr<float>(), rad.data_ptr<float>(), Kflat.data_ptr<float>(),
@@ -2699,12 +2699,12 @@ void r8i4_score_bt_aos_screen(
     cudaError_t e = cudaGetLastError();
     TORCH_CHECK(e == cudaSuccess, "screen launch: ", cudaGetErrorString(e));
 }
-#endif  // R8I4_MMA_SCREEN
+#endif  // RKI4_MMA_SCREEN
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m_) {
     m_.def("r8score", &r8score);
     m_.def("r8score_aos", &r8score_aos);
-    m_.def("r8i4_score_bt", &r8i4_score_bt,
+    m_.def("rki4_score_bt", &rki4_score_bt,
            py::arg("q"), py::arg("v4"), py::arg("vs"), py::arg("c8"),
            py::arg("cs"), py::arg("mu8"), py::arg("mus"), py::arg("bt"),
            py::arg("nsh"), py::arg("S"), py::arg("sm_scale"),
@@ -2713,12 +2713,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m_) {
            py::arg("csc_rope") = py::none(),
            py::arg("qout_rope") = py::none(),
            py::arg("hmax_pub") = py::none());
-    m_.def("r8i4_score_bt_aos", &r8i4_score_bt_aos);
-    m_.def("r8i4_score_bt_aos_fold", &r8i4_score_bt_aos_fold);
-    m_.def("r8i4_score_bt_aos_flat", &r8i4_score_bt_aos_flat);
-    m_.def("r8i4_score_bt_aos_flat_fold", &r8i4_score_bt_aos_flat_fold);
-#ifdef R8I4_MMA_SCREEN
-    m_.def("r8i4_score_bt_aos_screen", &r8i4_score_bt_aos_screen);
+    m_.def("rki4_score_bt_aos", &rki4_score_bt_aos);
+    m_.def("rki4_score_bt_aos_fold", &rki4_score_bt_aos_fold);
+    m_.def("rki4_score_bt_aos_flat", &rki4_score_bt_aos_flat);
+    m_.def("rki4_score_bt_aos_flat_fold", &rki4_score_bt_aos_flat_fold);
+#ifdef RKI4_MMA_SCREEN
+    m_.def("rki4_score_bt_aos_screen", &rki4_score_bt_aos_screen);
 #endif
 }
 """
@@ -2728,7 +2728,7 @@ _SMS = None
 
 
 # NOROPE (round A): scorer-side rope absorption -- the python flag only
-# controls whether r8i4_score_only passes the (sl, csc, qout) triple; the
+# controls whether rki4_score_only passes the (sl, csc, qout) triple; the
 # kernel branches on qout != nullptr at runtime (one binary, both paths).
 _NOROPE = (os.environ.get("LOCKS_NOROPE", "0") == "1"
            or os.environ.get("LOCKS_QFIRST_CO", "0") == "1")
@@ -2782,9 +2782,9 @@ def _get(verbose: bool = False):
         # hardcoded (nibble PRMT path). A non-i4 config must never reach a
         # CUDA build -- loud here, no fallback; the sm_120 torch twin and
         # the P4 i-axis template cases are the only other lanes.
-        from .r8i4_state import IBITS as _ibits
+        from .rki4_state import IBITS as _ibits
         assert _ibits == 4, (
-            f"locks r8i4 CUDA score TU is int4-only, LOCKS_R8I4_IBITS="
+            f"locks rki4 CUDA score TU is int4-only, LOCKS_RKI4_IBITS="
             f"{_ibits}: the i-axis CUDA case is deferred (P4); non-i4 runs "
             "the sm_120 torch twin lane only")
         from torch.utils.cpp_extension import load_inline
@@ -2792,64 +2792,64 @@ def _get(verbose: bool = False):
         _cf = ["-O3", "--use_fast_math", _arch.arch_flag()]
         if _os.environ.get("LOCKS_PTXAS_V"):       # register/occupancy report
             _cf += ["-Xptxas=-v"]
-        if _os.environ.get("R8I4_MMA"): _cf += ["-DR8I4_MMA"]
+        if _os.environ.get("RKI4_MMA"): _cf += ["-DRKI4_MMA"]
         # BIAS landed DEFAULT-ON 2026-07-16 (byte-gate PASS + event-time win
         # -5.3%/-8.4% at 256K/1M on top of SRED: it shortens the dependent
         # chain off the stall-carrying cw load; SCORE_KERNEL_ISSUE_BOUND.md
-        # section 9). R8I4_MMA_BIAS=0 is the explicit kill switch.
-        if _os.environ.get("R8I4_MMA_BIAS", "1") != "0":
-            _cf += ["-DR8I4_MMA_BIAS"]
+        # section 9). RKI4_MMA_BIAS=0 is the explicit kill switch.
+        if _os.environ.get("RKI4_MMA_BIAS", "1") != "0":
+            _cf += ["-DRKI4_MMA_BIAS"]
         # PEEL landed DEFAULT-ON 2026-07-16 (byte-gate PASS, -3.4%/-4.1% at
         # 256K/1M on SRED+BIAS; exact tt=0 closed form skips 2 exps/tile).
-        # R8I4_MMA_PEEL=0 is the explicit kill switch.
-        if _os.environ.get("R8I4_MMA_PEEL", "1") != "0":
-            _cf += ["-DR8I4_MMA_PEEL"]
+        # RKI4_MMA_PEEL=0 is the explicit kill switch.
+        if _os.environ.get("RKI4_MMA_PEEL", "1") != "0":
+            _cf += ["-DRKI4_MMA_PEEL"]
         # SRED landed DEFAULT-ON 2026-07-16 (byte-gate PASS + event-time win,
-        # ours_doc/SCORE_KERNEL_ISSUE_BOUND.md section 7). R8I4_MMA_SRED=0 is
+        # ours_doc/SCORE_KERNEL_ISSUE_BOUND.md section 7). RKI4_MMA_SRED=0 is
         # the explicit kill switch (compiles the pre-SRED loop).
-        if _os.environ.get("R8I4_MMA_SRED", "1") != "0":
-            _cf += ["-DR8I4_MMA_SRED"]
+        if _os.environ.get("RKI4_MMA_SRED", "1") != "0":
+            _cf += ["-DRKI4_MMA_SRED"]
         # LSE2 landed DEFAULT-ON 2026-07-16 night (BT-shape re-profile: kernel
         # ISSUE-bound, LSE2 -7.3%/-7.2% free-clock at 512K/1M shapes; cmpv
         # selection-identity gate PASS; token-equality PASS; E2E 512K +2.7%,
         # 1M +1.8%, 256K neutral -- SCORE_KERNEL_ISSUE_BOUND.md section 13).
         # The old dense-1M refutation was build-vintage-specific (dense now
-        # also faster). R8I4_MMA_LSE2=0 is the explicit kill switch.
-        if _os.environ.get("R8I4_MMA_LSE2", "1") != "0":
-            _cf += ["-DR8I4_MMA_LSE2"]
+        # also faster). RKI4_MMA_LSE2=0 is the explicit kill switch.
+        if _os.environ.get("RKI4_MMA_LSE2", "1") != "0":
+            _cf += ["-DRKI4_MMA_LSE2"]
         # Fix1 A-fragment occupancy knob (candidate experiment): default B
         # (Af spilled to smem, 9 blocks/SM); LOCKS_FIX1_AF_HOIST=1 = variant A
         # (Af hoisted in registers, ~7 blocks/SM). Only affects the deployed
         # BT/PGT16/G8 pipelined loop.
         if _os.environ.get("LOCKS_FIX1_AF_HOIST"): _cf += ["-DLOCKS_FIX1_AF_HOIST"]
         if _os.environ.get("LOCKS_FIX1_CARRYROW"): _cf += ["-DLOCKS_FIX1_CARRYROW"]
-        if _os.environ.get("R8I4_MMA_AOS"): _cf += ["-DR8I4_MMA_AOS"]
-        if _os.environ.get("R8I4_MMA_ALLG"):
+        if _os.environ.get("RKI4_MMA_AOS"): _cf += ["-DRKI4_MMA_AOS"]
+        if _os.environ.get("RKI4_MMA_ALLG"):
             # ALLG (rank campaign v2): tensor-core projection for G4 models.
             # Requires the AOS build; excludes MUC (kernel #errors enforce).
-            _cf += ["-DR8I4_MMA_ALLG"]
-        if _os.environ.get("R8I4_MMA_PFR"): _cf += ["-DR8I4_MMA_PFR"]
-        if _os.environ.get("R8I4_MMA_S1PROBE"): _cf += ["-DR8I4_MMA_S1PROBE"]
-        if _os.environ.get("R8I4_MMA_FLAT"): _cf += ["-DR8I4_MMA_FLAT"]
-        if _os.environ.get("R8I4_CP_NOEXP"): _cf += ["-DR8I4_CP_NOEXP"]
-        if _os.environ.get("R8I4_CP_NODT"): _cf += ["-DR8I4_CP_NODT"]
-        from .r8i4_state import MUC as _muc
+            _cf += ["-DRKI4_MMA_ALLG"]
+        if _os.environ.get("RKI4_MMA_PFR"): _cf += ["-DRKI4_MMA_PFR"]
+        if _os.environ.get("RKI4_MMA_S1PROBE"): _cf += ["-DRKI4_MMA_S1PROBE"]
+        if _os.environ.get("RKI4_MMA_FLAT"): _cf += ["-DRKI4_MMA_FLAT"]
+        if _os.environ.get("RKI4_CP_NOEXP"): _cf += ["-DRKI4_CP_NOEXP"]
+        if _os.environ.get("RKI4_CP_NODT"): _cf += ["-DRKI4_CP_NODT"]
+        from .rki4_state import MUC as _muc
         # rank v2: MUC is AOS-only (kernel #error enforces AOS+BIAS);
         # never emit the define on a six-slab build.
-        if _muc and _os.environ.get("R8I4_MMA_AOS"):
-            _cf += ["-DR8I4_MMA_MUC"]
-        if _os.environ.get("LOCKS_SCREEN"): _cf += ["-DR8I4_MMA_SCREEN"]
-        if _os.environ.get("LOCKS_PMAX_FOLDR"): _cf += ["-DR8I4_MMA_FOLDR"]
+        if _muc and _os.environ.get("RKI4_MMA_AOS"):
+            _cf += ["-DRKI4_MMA_MUC"]
+        if _os.environ.get("LOCKS_SCREEN"): _cf += ["-DRKI4_MMA_SCREEN"]
+        if _os.environ.get("LOCKS_PMAX_FOLDR"): _cf += ["-DRKI4_MMA_FOLDR"]
         # Removed opt-in arms (2026-07-21 cleanup, Wave 3a; each REFUTED with
         # its mechanism in ours_doc/REFUTED_ARMS_INDEX.md; recover from git
-        # tag pre-cleanup-2026-07-21): R8I4_NOUNPACK, R8I4_CUNROLL_N,
-        # R8I4_CPASYNC, R8I4_RING, R8I4_MMA_CPA, R8I4_MMA_DEDUP,
-        # R8I4_MMA_QREG, R8I4_MMA_CPRMT, R8I4_MMA_SVFOLD, R8I4_MMA_OCC10,
-        # R8I4_MMA_STAGE, R8I4_MMA_VCP, R8I4_MMA_OCC9, R8I4_MMA_ILV2,
-        # R8I4_MMA_ACC2, R8I4_MMA_DT2, LOCKS_BTPF, R8I4_NW.
+        # tag pre-cleanup-2026-07-21): RKI4_NOUNPACK, RKI4_CUNROLL_N,
+        # RKI4_CPASYNC, RKI4_RING, RKI4_MMA_CPA, RKI4_MMA_DEDUP,
+        # RKI4_MMA_QREG, RKI4_MMA_CPRMT, RKI4_MMA_SVFOLD, RKI4_MMA_OCC10,
+        # RKI4_MMA_STAGE, RKI4_MMA_VCP, RKI4_MMA_OCC9, RKI4_MMA_ILV2,
+        # RKI4_MMA_ACC2, RKI4_MMA_DT2, LOCKS_BTPF, RKI4_NW.
         # Rank knob (doc 19/21): ONE env drives the python layout
-        # (r8i4_state.RNK) and the kernel -DRNK; they assert-match at import.
-        if _rk := _os.environ.get("LOCKS_R8I4_RANK"): _cf += [f"-DRNK={int(_rk)}"]
+        # (rki4_state.RNK) and the kernel -DRNK; they assert-match at import.
+        if _rk := _os.environ.get("LOCKS_RKI4_RANK"): _cf += [f"-DRNK={int(_rk)}"]
         # ROPE GEOMETRY (model-agnostic, 2026-07-22): the NOROPE/QFIRST_CO
         # staging prelude ropes q in-kernel, so the arch's (rotary_dim,
         # neox) pair is compiled in.  GLM geometry -> NO flags and NO name
@@ -2858,7 +2858,7 @@ def _get(verbose: bool = False):
         # a warm torch-extensions cache can never hand Llama GLM's rope.
         from ..backend import _runtime as _rt
         _cf += _rt.rope_cflags()
-        _MOD = load_inline(name="locks_r8i4_score" + _rt.rope_tag(),
+        _MOD = load_inline(name="locks_rki4_score" + _rt.rope_tag(),
                            cpp_sources="",
                            cuda_sources=_SRC, extra_cuda_cflags=_cf,
                            verbose=bool(verbose or _os.environ.get("LOCKS_PTXAS_V")))
@@ -2890,7 +2890,7 @@ def auto_zsplit(n_req: int, n_kv: int, max_pages: int, mult=None) -> int:
     pushes the grid past a whole-wave boundary (partial-wave tail), so the
     proven 4*SMs is kept.  z-split partitions pages across CTAs writing DISJOINT
     score_h slots -> bitwise-invariant to the target; a pure launch-shape (perf)
-    knob (scratch_r8i4_port/ztune.py)."""
+    knob (scratch_rki4_port/ztune.py)."""
     if mult is None:
         mult = 5 if n_req <= 4 else 4
     target = mult * _sm_count()
@@ -2901,7 +2901,7 @@ def auto_zsplit(n_req: int, n_kv: int, max_pages: int, mult=None) -> int:
 def _lowbatch_mult(n_req: int, max_pages: int, G: int, d: int):
     """Low-batch (n_req <= 4) CTAs/SM target for auto_zsplit, mma-path-aware.
 
-    Returns None for every path except the R8I4_MMA G8-d128 flagship, so the
+    Returns None for every path except the RKI4_MMA G8-d128 flagship, so the
     dp4a kernel and all non-flagship geometries keep the shipped 5*SM EXACTLY
     (zsplit is a bitwise-invariant launch knob, but this keeps the default
     untouched).  The mma kernel frees registers (96 -> 56) to hold 9 CTAs/SM,
@@ -2911,13 +2911,13 @@ def _lowbatch_mult(n_req: int, max_pages: int, G: int, d: int):
     resident: more splits only add per-split fixed overhead), 128K ~9, 256K
     ~16, 1M ~32.  mult = clamp(max_pages/1024, 5, 32) fits all five measured
     ctx within ~0.5% of their per-ctx optimum, is monotone in ctx, and leaves
-    <= 64K UNCHANGED at 5 (no short-ctx regression).  LOCKS_R8I4_MMA_ZMULT
+    <= 64K UNCHANGED at 5 (no short-ctx regression).  LOCKS_RKI4_MMA_ZMULT
     forces a fixed mult (A/B tuning)."""
     # mma path activates only for the G8 instantiation (g8_enabled(): the C++
     # host picks g8 unless LOCKS_SCORE_NO_G8 forces the runtime g-tile path).
-    if (n_req <= 4 and os.environ.get("R8I4_MMA") and G == 8 and d == 128
+    if (n_req <= 4 and os.environ.get("RKI4_MMA") and G == 8 and d == 128
             and os.environ.get("LOCKS_SCORE_NO_G8") is None):
-        ov = os.environ.get("LOCKS_R8I4_MMA_ZMULT")
+        ov = os.environ.get("LOCKS_RKI4_MMA_ZMULT")
         # 2026-07-17 re-tune on h200x8-03 (post-AOS/LSE2; the 32-cap dated
         # from h200x4-04 pre-AOS): z-sweep at the BT shapes shows a clean
         # bowl at ONE EXACT RESIDENT WAVE (8 CTAs/SM at this kernel's
@@ -2956,19 +2956,19 @@ def _pack_aos(v4, vs, c8, cs, mu8, mus):
     return rec
 
 
-def r8i4_score(q, v4, vs, c8, cs, mu8, mus, S, sm_scale, zsplit=None):
+def rki4_score(q, v4, vs, c8, cs, mu8, mus, S, sm_scale, zsplit=None):
     """Packed-tensor entry (the standalone contract; gate battery + timing).
 
     q (R, n_kv*G, d) bf16; v4/vs/c8/cs/mu8/mus in the (n_kv, P, ...) packed
     layout of ``build_summary``; S (R, n_kv, G, P) fp32 out (caller-owned).
-    ``zsplit`` None = auto-size from the device SM count.  R8I4_MMA_AOS
+    ``zsplit`` None = auto-size from the device SM count.  RKI4_MMA_AOS
     builds repack into the 832B record (cached; identical bytes) and launch
     the record kernel through ``r8score_aos``."""
     if zsplit is None:
         n_req = q.shape[0]
         mult = _lowbatch_mult(n_req, v4.shape[1], S.shape[2], v4.shape[3] * 2)
         zsplit = auto_zsplit(n_req, v4.shape[0], v4.shape[1], mult=mult)
-    if os.environ.get("R8I4_MMA_AOS"):
+    if os.environ.get("RKI4_MMA_AOS"):
         rec = _pack_aos(v4, vs, c8, cs, mu8, mus)
         _get().r8score_aos(q, rec, S, float(sm_scale), int(zsplit))
         return
@@ -2976,9 +2976,9 @@ def r8i4_score(q, v4, vs, c8, cs, mu8, mus, S, sm_scale, zsplit=None):
                    int(zsplit))
 
 
-def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
+def rki4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
                     scale: float) -> None:
-    """HOT Stage-A.1 (r8i4): write ``st.score`` (R, n_kv, MP) fp32 for the
+    """HOT Stage-A.1 (rki4): write ``st.score`` (R, n_kv, MP) fp32 for the
     selectable region from the layer's packed slabs.
 
     The BT kernel writes the per-head page LSE into ``st.score_h``
@@ -2992,7 +2992,7 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
     launch stream is resolved at call time, so a future refresh-period /
     side-stream scheduler can drive this entry unchanged.  Fixed launch
     shapes, no host sync, no allocation -> full-CUDA-graph safe."""
-    # sm_120 (Blackwell): the hand-CUDA r8i4 score kernel's sm_120 dispatch
+    # sm_120 (Blackwell): the hand-CUDA rki4 score kernel's sm_120 dispatch
     # lane was removed (commit 2404b45). Route to the plain-torch core-logic
     # twin, which fills st.score_h identically (byte-faithful to the G1 torch
     # reference incl. the i8-q round-trip). EXPLICIT arch gate -- like FA's
@@ -3025,12 +3025,12 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
                     else "LOCKS_FORCE_SCORE_TORCH=1 (page-geometry validation "
                          "lane -- e.g. page 64 on Hopper, which the {16,32}-"
                          "only hand-CUDA scorer rejects)")
-            print(f"[locks] FALLBACK r8i4 score: {_why} -- the hand-CUDA "
+            print(f"[locks] FALLBACK rki4 score: {_why} -- the hand-CUDA "
                   "scorer lane is skipped; running the plain-torch twin "
                   "(score_h identical, NOT the deployed kernel path)",
                   flush=True)
-        from . import r8i4_score_torch as _r8t
-        _r8t.r8i4_score_torch(st, layer, q, block_table, seq_lens, n_req, scale)
+        from . import rki4_score_torch as _r8t
+        _r8t.rki4_score_torch(st, layer, q, block_table, seq_lens, n_req, scale)
         st._hmax_armed = False
         return
     z = st.zsplit if st.zsplit else auto_zsplit(
@@ -3067,11 +3067,11 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
                   "(engine memory-profile pass only; outputs discarded)",
                   flush=True)
         st.score_h.zero_()
-    elif os.environ.get("R8I4_MMA_AOS") and getattr(st, "pp_rec", None) is not None:
+    elif os.environ.get("RKI4_MMA_AOS") and getattr(st, "pp_rec", None) is not None:
         # NOROPE covers the deployed six-slab entry only (round A scope);
         # the AOS entries stage q un-roped and would silently mis-score.
         assert not _NOROPE, \
-            "LOCKS_NOROPE=1 is not wired for the R8I4_MMA_AOS entries"
+            "LOCKS_NOROPE=1 is not wired for the RKI4_MMA_AOS entries"
         # BT-AOS: read the 832B records the build wrote through the state's
         # strided views (one pointer per page instead of six re-derivations;
         # nsys TAUCCHK: the six-array BT kernel was 89.9us/layer = 2.2x dense).
@@ -3089,7 +3089,7 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
             _selc._ensure_split_scratch(st, st.n_kv, st.max_pages,
                                         want_pp=False)
             st._fold_Zs = int(z)
-            _get().r8i4_score_bt_aos_flat_fold(
+            _get().rki4_score_bt_aos_flat_fold(
                 q, st.pp_rec[layer], block_table, st.n_sel_hi, st.score_h,
                 st._sp_gpmax, st._sp_ghist, st._flat_K_cur, float(scale),
                 int(z), int(n_req))
@@ -3104,7 +3104,7 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
                     float(os.environ.get("LOCKS_FLAT_K0", "30.0")),
                     dtype=torch.float32, device=q.device)
             st._flat_K_cur = st._flat_K[layer]
-            _get().r8i4_score_bt_aos_flat(q, st.pp_rec[layer], block_table,
+            _get().rki4_score_bt_aos_flat(q, st.pp_rec[layer], block_table,
                                           st.n_sel_hi, st.score_h,
                                           st._flat_K_cur, float(scale),
                                           int(z), int(n_req))
@@ -3117,12 +3117,12 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
             _selc._ensure_split_scratch(st, st.n_kv, st.max_pages,
                                         want_pp=False)
             st._fold_Zs = int(z)
-            _get().r8i4_score_bt_aos_fold(q, st.pp_rec[layer], block_table,
+            _get().rki4_score_bt_aos_fold(q, st.pp_rec[layer], block_table,
                                           st.n_sel_hi, st.score_h,
                                           st._sp_gpmax, st._sp_ghist,
                                           float(scale), int(z), int(n_req))
         else:
-            _get().r8i4_score_bt_aos(q, st.pp_rec[layer], block_table,
+            _get().rki4_score_bt_aos(q, st.pp_rec[layer], block_table,
                                      st.n_sel_hi, st.score_h, float(scale),
                                      int(z), int(n_req))
     else:
@@ -3151,19 +3151,19 @@ def r8i4_score_only(st, layer: int, q, block_table, seq_lens, n_req: int,
             assert csc is not None, \
                 "LOCKS_NOROPE=1 but the cos_sin_cache is not wired " \
                 "(register._wire_norope did not run)"
-            _get().r8i4_score_bt(q, v4, vs, c8, cs, mu8, mus, block_table,
+            _get().rki4_score_bt(q, v4, vs, c8, cs, mu8, mus, block_table,
                                  st.n_sel_hi, st.score_h, float(scale),
                                  int(z), int(n_req), sl_rope=seq_lens,
                                  csc_rope=csc, qout_rope=st.q_rope,
                                  hmax_pub=_hmax_buf(st))
         else:
-            _get().r8i4_score_bt(q, v4, vs, c8, cs, mu8, mus, block_table,
+            _get().rki4_score_bt(q, v4, vs, c8, cs, mu8, mus, block_table,
                                  st.n_sel_hi, st.score_h, float(scale),
                                  int(z), int(n_req),
                                  hmax_pub=_hmax_buf(st))
         st._hmax_armed = _HMAX_ON
 
-def r8i4_select_only(st, n_req: int) -> None:
+def rki4_select_only(st, n_req: int) -> None:
     """Stage-A.2: GQA-combine st.score_h -> st.score and run page selection
     (fused nrm+topb when available).  Split from the score launch so a
     two-stream prep pipeline (LOCKS_STALE_PIPE) can overlap select(L) with
@@ -3183,7 +3183,7 @@ def r8i4_select_only(st, n_req: int) -> None:
         # top-b, then sets st._topb_done so the adapter's topb call no-ops.
         # Selection is byte-equal to the separate passes (tests/
         # test_tailopt.py::test_fused_nrmtopb_bitwise_eq_unfused + GATE A of
-        # the r8i4 port); the generic Triton combine grows with MP (~84 us/
+        # the rki4 port); the generic Triton combine grows with MP (~84 us/
         # layer extra at 128K bs1).  has_hmax follows the handshake arming
         # (LOCKS_HMAX=1 + a publishing score launch; default off).  G <= 8 is
         # the fused kernel's compiled bound.  NO-FALLBACK RULE (2026-07-22):
@@ -3193,9 +3193,9 @@ def r8i4_select_only(st, n_req: int) -> None:
         # now a loud error, never a silent slower path.
         from . import select_cuda
         assert st.G <= 8, (
-            f"locks r8i4: fused nrm+topb supports G <= 8, got G={st.G}")
+            f"locks rki4: fused nrm+topb supports G <= 8, got G={st.G}")
         assert select_cuda.fused_available(), (
-            "locks r8i4: the fused nrm+topb selector failed to build "
+            "locks rki4: the fused nrm+topb selector failed to build "
             "(LOCKS_CUDA_VERBOSE=1 prints the nvcc log); there is no "
             "fallback combine")
         _ensure_hmax(st)
@@ -3213,8 +3213,8 @@ def r8i4_select_only(st, n_req: int) -> None:
         torch.amax(st.score_h, dim=2, out=st.score)
 
 
-def r8i4_score_state(st, layer: int, q, block_table, seq_lens, n_req: int,
+def rki4_score_state(st, layer: int, q, block_table, seq_lens, n_req: int,
                      scale: float) -> None:
     """Monolithic prep entry (score + combine/select), unchanged contract."""
-    r8i4_score_only(st, layer, q, block_table, seq_lens, n_req, scale)
-    r8i4_select_only(st, int(n_req))
+    rki4_score_only(st, layer, q, block_table, seq_lens, n_req, scale)
+    rki4_select_only(st, int(n_req))

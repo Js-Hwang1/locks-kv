@@ -114,10 +114,10 @@ class MappedHostVPool:
     for byte-identical output vs the resident path (the equality gate).
     """
 
-    # Documented pinned-alloc trap (LOCKS_MEM_R8I4.md B2): allocating X GiB of
+    # Documented pinned-alloc trap (LOCKS_MEM_RKI4.md B2): allocating X GiB of
     # pinned pool consumes MORE than X GiB of host MemAvailable (the pinned
     # allocation + torch's caching-host-allocator slack + the UVA mapping page
-    # tables). MEASURED on h200x8-03 (scratch_mem_r8i4/bench_fetch.py): a 1 GiB
+    # tables). MEASURED on h200x8-03 (scratch_mem_rki4/bench_fetch.py): a 1 GiB
     # pinned pool dropped MemAvailable by 2.90 GiB. Guard the allocation LOUDLY
     # against MemAvailable at this factor instead of letting the OOM killer
     # take the engine process. Conservative by design (refuses early); rerun

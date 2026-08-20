@@ -1,6 +1,6 @@
-"""r8i4 page-LSE score -- plain-torch CORE LOGIC for sm_120 (Blackwell).
+"""rki4 page-LSE score -- plain-torch CORE LOGIC for sm_120 (Blackwell).
 
-The hand-CUDA r8i4 score kernel (``r8i4_score_cuda.r8i4_score_bt``) is
+The hand-CUDA rki4 score kernel (``rki4_score_cuda.rki4_score_bt``) is
 Hopper-only and its sm_120 dispatch lane was removed (commit 2404b45,
 ``_runtime.py:797-800``). This module is the arch-gated sm_120 realization of
 the SAME core logic: it reads the identical packed summary slabs
@@ -20,7 +20,7 @@ gate), INCLUDING the per-(kv-head, group) int8 round-trip of q the kernel does
     score_h[h,g,p] = logsumexp_t tok[h,g,t]                    (Cref=c8*cs, muref=mu8*mus)
 
 with ``qref = round(q/qs)*qs``, ``qs = |q|.amax(-1)/127`` per (h,g).
-The IBITS-bit basis (LOCKS_R8I4_IBITS; i4 default) is unpacked column-major
+The IBITS-bit basis (LOCKS_RKI4_IBITS; i4 default) is unpacked column-major
 via ``_unpack_ibit`` (i4: lo nibble = even-d row, hi = odd-d, two's-complement
 ``((n^8)-8)``) -- exactly ``_write_post``'s ``_pack_ibit`` in reverse.
 Pure torch (einsum/logsumexp), no CUDA/Triton.
@@ -31,10 +31,10 @@ import os as _os
 
 import torch
 
-from .r8i4_state import IBITS
+from .rki4_state import IBITS
 
 _ANNOUNCED = False
-_SCORE_MS = 0.0   # LOCKS_R8I4_TIME=1 profiling accumulators (GPU-event ms)
+_SCORE_MS = 0.0   # LOCKS_RKI4_TIME=1 profiling accumulators (GPU-event ms)
 _SCORE_N = 0
 
 
@@ -56,17 +56,17 @@ def _unpack_ibit(vb: torch.Tensor, d: int) -> torch.Tensor:
 
 
 @torch.no_grad()
-def r8i4_score_torch(st, layer: int, q, block_table, seq_lens, n_req: int,
+def rki4_score_torch(st, layer: int, q, block_table, seq_lens, n_req: int,
                      scale: float, page_chunk: int = 8192) -> None:
     """Fill ``st.score_h`` (R, n_kv, G, MP) with the per-head page LSE for the
     selectable region [0, n_sel_hi[r]) of each request. sm_120 core-logic twin
-    of ``r8i4_score_cuda.r8i4_score_only``'s six-slab BT launch. seq_lens is
+    of ``rki4_score_cuda.rki4_score_only``'s six-slab BT launch. seq_lens is
     unused (every scored page is finalized, as in the kernel)."""
     global _ANNOUNCED
     if not _ANNOUNCED:
         _ANNOUNCED = True
-        print("[locks] r8i4 SCORE: sm_120 torch core-logic path ACTIVE "
-              "(fp32, bitwise == fp32 r8i4 reference; Hopper CUDA lane removed)",
+        print("[locks] rki4 SCORE: sm_120 torch core-logic path ACTIVE "
+              "(fp32, bitwise == fp32 rki4 reference; Hopper CUDA lane removed)",
               flush=True)
     n_kv, G, d, page = int(st.n_kv), int(st.G), int(st.d), int(st.page)
     v4, vs, c8, cs, mu8, mus, _tag = st.layer_state(layer)
@@ -82,20 +82,20 @@ def r8i4_score_torch(st, layer: int, q, block_table, seq_lens, n_req: int,
     st.score_h.zero_()
 
     # FULL fp32: TF32 (10-bit mantissa) injects ~1e-3 error into the einsums and
-    # flips near-tie pages at the top-b boundary; the r8i4 score is a real-valued
+    # flips near-tie pages at the top-b boundary; the rki4 score is a real-valued
     # estimator, so compute it in true fp32 -> bitwise-identical to the fp32
     # ground-truth reference (gate: maxabs 0, page-set Jaccard 1.0). Disable TF32
     # only for THIS computation (single-stream decode; restored immediately) so the
     # model forward's TF32 speed is untouched.
     _tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
-    _prof = _os.environ.get("LOCKS_R8I4_TIME") == "1"
+    _prof = _os.environ.get("LOCKS_RKI4_TIME") == "1"
     if _prof:
         global _SCORE_MS, _SCORE_N
         _e0 = torch.cuda.Event(enable_timing=True); _e1 = torch.cuda.Event(enable_timing=True)
         _e0.record()
     try:
-        _r8i4_score_torch_fp32(st, layer, q, block_table, n_req, scale, page_chunk,
+        _rki4_score_torch_fp32(st, layer, q, block_table, n_req, scale, page_chunk,
                                n_kv, G, d, page, v4, vs, c8, cs, mu8, mus)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = _tf32
@@ -103,12 +103,12 @@ def r8i4_score_torch(st, layer: int, q, block_table, seq_lens, n_req: int,
         _e1.record(); torch.cuda.synchronize()
         _SCORE_MS += _e0.elapsed_time(_e1); _SCORE_N += 1
         if _SCORE_N % 240 == 0:
-            print(f"[locks] r8i4 torch score PROFILE: {_SCORE_N} calls, "
+            print(f"[locks] rki4 torch score PROFILE: {_SCORE_N} calls, "
                   f"{_SCORE_MS/_SCORE_N:.2f} ms/call, {_SCORE_MS/1000:.1f}s total",
                   flush=True)
 
 
-def _r8i4_score_torch_fp32(st, layer, q, block_table, n_req, scale, page_chunk,
+def _rki4_score_torch_fp32(st, layer, q, block_table, n_req, scale, page_chunk,
                            n_kv, G, d, page, v4, vs, c8, cs, mu8, mus) -> None:
     NB = int(v4.shape[0])
     RNK = int(v4.shape[-2])

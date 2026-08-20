@@ -10,8 +10,8 @@ capture passes -- takes the stock fused ``F.linear`` plus vLLM's in-place
 rotary inside the op body.
 
 UNION KERNEL RETIRED (2026-07-22, BATCHED_CO_DESIGN 2.7).  This file used to
-also carry a fat ``coqkv_kernel`` that ran [kv-GEMV || r8i4 score] in one
-launch by compiling ``r8i4_score_cuda._SRC`` with ``-DR8I4_DEVICE_BODY``.  It
+also carry a fat ``coqkv_kernel`` that ran [kv-GEMV || rki4 score] in one
+launch by compiling ``rki4_score_cuda._SRC`` with ``-DRKI4_DEVICE_BODY``.  It
 is gone, for two independent reasons:
 
   * it was NOT LAUNCHED in the deployed set -- with ``LOCKS_QFIRST_FIXC=1``
@@ -124,7 +124,7 @@ def ensure_co_op() -> None:
                     "LOCKS_QFIRST_FIXC: gemv extension lacks kv_gemv_nf"
                     " (built without -DLOCKS_FIXC?). Prebuild offline "
                     "with LOCKS_QFIRST_FIXC=1 -- no silent fallback.")
-                from ..selection import r8i4_score_cuda as rsc
+                from ..selection import rki4_score_cuda as rsc
                 out = torch.empty(nt, weight.shape[0],
                                   dtype=hidden.dtype,
                                   device=hidden.device)
@@ -135,7 +135,7 @@ def ensure_co_op() -> None:
                 # score kernel to rope; set it here (the op runs first) because
                 # a previous mixed step may have left it True.
                 st._q_preroped = False
-                rsc.r8i4_score_only(st, int(lidx), q3, bt, sl, nt,
+                rsc.rki4_score_only(st, int(lidx), q3, bt, sl, nt,
                                     float(scale))
                 _runtime.fixc_arm_proj(int(lidx), hidden, weight, gb,
                                        out[:, qs:], qs, positions)

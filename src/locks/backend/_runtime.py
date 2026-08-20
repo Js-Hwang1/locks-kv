@@ -135,12 +135,12 @@ def tier_layer_index(tier, kv_cache) -> int:
     return lidx
 
 
-def r8i4_selection_available() -> bool:
-    """True when locks.selection exposes the r8i4 Stage-A surface.
+def rki4_selection_available() -> bool:
+    """True when locks.selection exposes the rki4 Stage-A surface.
     (Import errors propagate -- see r8_selection_available.)"""
     from .. import selection as sel
     return all(getattr(sel, n, None) is not None for n in
-               ("R8i4State", "derive_page_params", "r8i4_build_refresh"))
+               ("Rki4State", "derive_page_params", "rki4_build_refresh"))
 
 
 
@@ -430,7 +430,7 @@ def _seg_pair(key):
 # QF2 (2026-07-19, user lane): score OFF the critical path.  The patched GLM
 # forward (register.py) projects Q first, ropes it, and calls
 # torch.ops.locks_qf.prescore(q, lidx) BEFORE the KV projection; the op forks
-# the score (r8i4_score_only, the same kernel/bytes) onto a side stream so it
+# the score (rki4_score_only, the same kernel/bytes) onto a side stream so it
 # overlaps KV-GEMM + rope-k + kv_write.  The select adapter below consumes it
 # (event wait + select_only) instead of running the serial score.  Selection
 # math untouched: same q bytes (QF1 gate: scores BITWISE via the int8
@@ -476,7 +476,7 @@ _co_mark: dict = {}
 # FIX-C (session-P lever 1, opt-in 2026-07-22, ours_doc/
 # H200_SESSION_P_RESULTS.md route decision): union-kernel retirement +
 # select-cover schedule at nt==1 under the CO wire.  The locks_co.qkv op
-# runs q_gemv + the DEPLOYED-TU score (r8i4_score_only: bt numerics class
+# runs q_gemv + the DEPLOYED-TU score (rki4_score_only: bt numerics class
 # = the CO-OFF/>=128K reference class, NOROPE prelude ropes q into
 # st.q_rope, hmax published) and DEFERS the kv projection; the write hook
 # defers rope+cache; the select adapter flushes both DIRECTLY BEHIND the
@@ -635,10 +635,10 @@ def qf2_prescore(q2d, lidx: int) -> None:
     cur = _t.cuda.current_stream(device=q2d.device)
     ev_f.record(cur)
     q3 = q2d.view(1, st.n_kv * st.G, st.d)
-    from ..selection import r8i4_score_cuda
+    from ..selection import rki4_score_cuda
     with _t.cuda.stream(_qf2_stream):
         _qf2_stream.wait_event(ev_f)
-        r8i4_score_cuda.r8i4_score_only(st, int(lidx), q3, bt, sl, 1,
+        rki4_score_cuda.rki4_score_only(st, int(lidx), q3, bt, sl, 1,
                                         float(scale))
         ev_d.record(_qf2_stream)
     _qf2_mark[lidx] = _qf2_step
@@ -658,20 +658,20 @@ def _qf2_consume(st, lidx: int) -> bool:
     return True
 
 
-def _r8i4_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
+def _rki4_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
                          cfg) -> None:
-    """Bridge-signature Stage-A entry for the r8i4 score mode.
+    """Bridge-signature Stage-A entry for the rki4 score mode.
 
     The S4 register-pipelined CUDA kernel scores every selectable page from
     the packed summary slabs into ``st.score_h`` (per-head LSE); the GQA
     combine reduces it into ``st.score`` exactly where the quad/clse path
     combines (nrm via the shared ``_nrm_launch`` passes, max via amax), and
-    the score-agnostic radix top-b consumes ``st.score`` unchanged.  r8i4 is
+    the score-agnostic radix top-b consumes ``st.score`` unchanged.  rki4 is
     CUDA-only BY DESIGN (there is no Triton reference): a kernel-build
     failure raises loudly instead of latching a fallback (the no-fallback
     rule).  ``derive=False`` semantics: the builder derived the per-step page
     params already."""
-    from ..selection import r8i4_score_cuda
+    from ..selection import rki4_score_cuda
 
     lidx = _layer_index(st, kv_cache)
     _pb = None
@@ -696,20 +696,20 @@ def _r8i4_select_adapter(q, kv_cache, block_table, seq_lens, st, n_req, scale,
             # op via the DEPLOYED TU (bt class) instead; flush the deferred
             # [kv_gemv_nf -> rope_and_cache_fixc] pair directly behind the
             # select launch so they ride its entry-trigger cover window.
-            r8i4_score_cuda.r8i4_select_only(st, n_req)
+            rki4_score_cuda.rki4_select_only(st, n_req)
             if _FIXC:
                 fixc_flush(int(lidx))
         elif _QF2 and _qf2_consume(st, int(lidx)):
             # QF2: score_h already computed on the side stream from the SAME
             # roped q bytes -- combine+select only.
-            r8i4_score_cuda.r8i4_select_only(st, n_req)
+            rki4_score_cuda.rki4_select_only(st, n_req)
         else:
-            r8i4_score_cuda.r8i4_score_state(st, lidx, q, block_table,
+            rki4_score_cuda.rki4_score_state(st, lidx, q, block_table,
                                              seq_lens, n_req, scale)
     global _PPSEL_ANNOUNCED
     if not _PPSEL_ANNOUNCED:
         _PPSEL_ANNOUNCED = True
-        print(f"[locks] selection kernels: CUDA r8i4 score (S4, zsplit="
+        print(f"[locks] selection kernels: CUDA rki4 score (S4, zsplit="
               f"{st.zsplit or 'auto'}, combine={st.combine}) + "
               f"{'Triton' if os.environ.get('LOCKS_TOPB_TRITON', '0') == '1' else 'CUDA radix'}"
               " top-b", flush=True)
@@ -848,7 +848,7 @@ def resolve_selection():
 
     NO-FALLBACK RULE (2026-07-22): the configured score mode is now a
     PRECONDITION, not a preference.  The old code silently downgraded
-    r8i4 -> quad -> r8 -> bridge whenever a surface was missing, which
+    rki4 -> quad -> r8 -> bridge whenever a surface was missing, which
     serves and MEASURES a different selector under the same tag."""
     if not _force_bridge():
         from .. import selection as sel
@@ -858,7 +858,7 @@ def resolve_selection():
             def _derive(st_, sl_, nr_, __d=sel.derive_page_params):
                 qf2_derive_tick()          # per-step nonce for the prescore
                 return __d(st_, sl_, nr_)
-        return (sel.R8i4State, _derive, _r8i4_select_adapter, True)
+        return (sel.Rki4State, _derive, _rki4_select_adapter, True)
     global _BRIDGE_SAID
     if not _BRIDGE_SAID:
         _BRIDGE_SAID = True
@@ -875,7 +875,7 @@ def _check_selection_surface() -> None:
     """One-shot PRECONDITION check for the configured score mode.
 
     NO-FALLBACK RULE (2026-07-22): resolve_selection used to silently
-    downgrade r8i4 -> quad -> r8 -> eager bridge whenever a surface was
+    downgrade rki4 -> quad -> r8 -> eager bridge whenever a surface was
     missing (and swallowed the ImportError that made it missing), i.e. it
     served and MEASURED a different selector under the same tag.  The mode
     is now a precondition; the only legal way to the bridge is the explicit
@@ -884,9 +884,9 @@ def _check_selection_surface() -> None:
     global _SURFACE_CHECKED
     if _SURFACE_CHECKED:
         return
-    assert r8i4_selection_available(), (
-        "locks: the r8i4 Stage-A surface is incomplete (locks.selection is "
-        "missing R8i4State / derive_page_params / r8i4_build_refresh) -- no "
+    assert rki4_selection_available(), (
+        "locks: the rki4 Stage-A surface is incomplete (locks.selection is "
+        "missing Rki4State / derive_page_params / rki4_build_refresh) -- no "
         "silent bridge fallback. Fix the import, or set LOCKS_FORCE_BRIDGE=1 "
         "to ask for the eager validation bridge explicitly.")
     _SURFACE_CHECKED = True

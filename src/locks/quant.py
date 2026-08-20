@@ -16,7 +16,7 @@ cache short of new decode kernels.  This is an ACCURACY study: fake-quant
 packed-int cache, no speed claim.
 
 WHAT IT DOES.  Pages are fake-quantized exactly ONCE, when they FINALIZE --
-the same lifecycle point where the r8i4 summary is built (`_r8i4_write` is the
+the same lifecycle point where the rki4 summary is built (`_rki4_write` is the
 single funnel for bulk / delta / tail / refresh / overlap builds).  The
 partial tail page stays fp16 inside the always-attended window: this is the
 page-aligned analog of KIVI's fp16 residual window (ours is <= page tokens =
@@ -26,7 +26,7 @@ page-aligned analog of KIVI's fp16 residual window (ours is <= page tokens =
         overwritten with quantize(dequantize(.)) -> decode attends quantized
         KV at extreme sparsity, selection signal is fp16-built.
   pre   summary built FROM the quantized K (double-quantization of the
-        selection signal: the r8i4 summary is itself int4/int8 inside), AND
+        selection signal: the rki4 summary is itself int4/int8 inside), AND
         the cache is overwritten -> both selection and attention see
         quantized KV.
   selq  summary built from quantized K, cache left fp16 -> isolates the
@@ -62,7 +62,7 @@ captured CUDA graph, bypassing the hook -- and the hook's data-dependent
 filter is not capturable; tail-graph off is documented bitwise-inert on the
 summaries); LOCKS_PREFILL_OVERLAP=0 (the side-stream build would overwrite
 cache pages concurrently with main-stream prefill attention reads).  The MLA
-path does not route through `_r8i4_write` and is NOT covered (the GQA r8i4
+path does not route through `_rki4_write` and is NOT covered (the GQA rki4
 mainline is the study's scope); its builds never stash `_kvq_layers`, so any
 accidental use raises in `_writeback` rather than silently no-opping.
 
@@ -188,7 +188,7 @@ def check_compat(cfg) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The build hook (called from r8i4_build._r8i4_write when KVQ is not None).    #
+# The build hook (called from rki4_build._rki4_write when KVQ is not None).    #
 # --------------------------------------------------------------------------- #
 def _done_slab(st) -> torch.Tensor:
     d = getattr(st, "_kvq_done", None)
@@ -237,7 +237,7 @@ def _writeback(st, Kq: torch.Tensor, lidx: torch.Tensor,
 
 def build_hook(st, Kp_flat: torch.Tensor, lidx: torch.Tensor,
                bidx: torch.Tensor):
-    """The single seam in ``_r8i4_write``.  Returns ``None`` when every page
+    """The single seam in ``_rki4_write``.  Returns ``None`` when every page
     in the call is already processed and unchanged (skip the write entirely),
     else ``(K_for_summary, tag_override, lidx, bidx)`` where ``tag_override``
     (or the tag `_write_pre` extracts from ``K_for_summary`` when None) always

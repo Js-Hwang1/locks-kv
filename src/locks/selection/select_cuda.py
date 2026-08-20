@@ -3332,7 +3332,7 @@ def fused_available() -> bool:
     """True when the module builds and exposes the fused nrm+topb kernel.
 
     NO-FALLBACK RULE (2026-07-22): a BUILD FAILURE is no longer swallowed
-    into False.  It used to route the deployed r8i4 chain to the Triton
+    into False.  It used to route the deployed rki4 chain to the Triton
     nrm passes (a different implementation, ~84 us/layer at 128K) with no
     log line, so the cell measured a configuration nobody asked for.  The
     only legal way to leave the fused consumer is the explicit

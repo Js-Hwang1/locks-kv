@@ -42,7 +42,7 @@ _CUDA_SRC = r"""
 // GLM-4 (rotary_dim 64, interleaved pairing), silently wrong for half-split
 // (neox) archs.  It is now a COMPILE-TIME pair from _runtime.rope_cflags(),
 // which emits nothing on GLM geometry -- the deployed GLM TU is byte-identical
-// to the pre-2026-07-22 build.  See src/locks/selection/r8i4_score_cuda.py for
+// to the pre-2026-07-22 build.  See src/locks/selection/rki4_score_cuda.py for
 // the twin definition (the two kernels must agree element for element: the
 // score kernel ropes q, this one ropes k).
 #ifndef LOCKS_ROT_DIM

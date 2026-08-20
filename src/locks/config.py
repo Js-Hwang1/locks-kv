@@ -53,9 +53,9 @@ class LocksConfig:
     # Required for mem-kv (K is not resident); optional for the others.
     r8_screen: bool = False
     r8_rank: int = 8
-    # ---- selection summary: r8i4, the ONLY score ------------------------- #
+    # ---- selection summary: rki4, the ONLY score ------------------------- #
     # The packed rank-8 int-4 page-projection summary scored by the S4
-    # register-pipelined hand-CUDA kernel (ours_doc/R8I4_KERNELS.md): int4
+    # register-pipelined hand-CUDA kernel (ours_doc/RKI4_KERNELS.md): int4
     # COLUMN-major basis V (per-column bf16 scales) + int8 coeffs C (per-token
     # bf16 scales) + int8 mu -> exact per-head page-LSE estimate, streamed at
     # 5d + 10*page + 18 B per (page, kv-head): ~820 B at (d=128, page 16) =
@@ -63,8 +63,8 @@ class LocksConfig:
     # (no Triton reference exists).  Supported geometry (TORCH_CHECKed at
     # wiring): d in {64, 128, 256}, page in {16, 32, 64} (64 = six-slab
     # lane only; CUDA score/decode + AOS records stay {16,32}), rank any
-    # integer in [1, page-1] (LOCKS_R8I4_RANK; CUDA kernel stays {2,4,8}),
-    # V-basis bits in {2, 4, 8} (LOCKS_R8I4_IBITS; CUDA + AOS stay i4),
+    # integer in [1, page-1] (LOCKS_RKI4_RANK; CUDA kernel stays {2,4,8}),
+    # V-basis bits in {2, 4, 8} (LOCKS_RKI4_IBITS; CUDA + AOS stay i4),
     # G <= 8 query heads per
     # kv head (the fused nrm+topb selector's bound; validate_geometry enforces
     # it at wiring time -- G and n_kv are runtime parameters).
@@ -78,12 +78,12 @@ class LocksConfig:
     #     group-max was the WORST combine.  Graph-safe (fixed extra passes).
     #   "max" = the plain GQA group max (kept reachable for ablation).
     quad_combine: Literal["max", "nrm"] = "nrm"
-    # r8i4 score-kernel page-split (grid.z of the S4 scorer).  None (default)
+    # rki4 score-kernel page-split (grid.z of the S4 scorer).  None (default)
     # = auto-size from the device SM count at launch (fills ~4 blocks/SM at
     # the step's (n_req x n_kv) base grid).  Resolved ONCE at plugin init
-    # (this field, or the LOCKS_R8I4_Z env read in load()); the kernel never
+    # (this field, or the LOCKS_RKI4_Z env read in load()); the kernel never
     # reads the environment.
-    r8i4_zsplit: Optional[int] = None
+    rki4_zsplit: Optional[int] = None
 
     # ---- Stage B / tier (mem variants only) ------------------------------ #
     # Hot-buffer slots per (layer, kv-head). <= 0 (default) = AUTO working-set
@@ -95,7 +95,7 @@ class LocksConfig:
     hot_slots: int = 0
     # AUTO hot sizing ratio S/b (measured hit curve: 3.0 -> ~.91 cold-start /
     # ~.98 steady RULER reuse, 6.0 -> ~.98 cold-start). Default 6.0 = shipped
-    # behavior; the r8i4-MEM design point (LOCKS_MEM_R8I4.md) runs 3.0.
+    # behavior; the rki4-MEM design point (LOCKS_MEM_RKI4.md) runs 3.0.
     # Pure VRAM<->fetch knob, bitwise-free. Ignored when hot_slots > 0.
     hot_ratio: float = 6.0
     v_blocks: Optional[int] = None  # V-staging pool blocks (None = auto-size)
@@ -149,11 +149,11 @@ class LocksConfig:
             raise ValueError(f"coverage must be in (0,1], got {self.coverage}")
         if self.budget is not None and not (0.0 < self.budget <= 1.0):
             raise ValueError(f"budget must be in (0,1], got {self.budget}")
-        if self.r8i4_zsplit is not None and not (
-                1 <= self.r8i4_zsplit <= 65535):
+        if self.rki4_zsplit is not None and not (
+                1 <= self.rki4_zsplit <= 65535):
             raise ValueError(
-                f"r8i4_zsplit must be None (auto) or in [1, 65535] (CUDA "
-                f"gridDim.z limit), got {self.r8i4_zsplit}")
+                f"rki4_zsplit must be None (auto) or in [1, 65535] (CUDA "
+                f"gridDim.z limit), got {self.rki4_zsplit}")
         if self.quad_combine not in ("max", "nrm"):
             raise ValueError(
                 f"quad_combine must be 'max' or 'nrm', got {self.quad_combine!r}")
@@ -200,11 +200,11 @@ class LocksConfig:
         _sc = os.environ.get("LOCKS_MEM_SUMMARY_CACHE")
         if _sc is not None and "mem_summary_cache" not in data:
             data["mem_summary_cache"] = _sc not in ("", "0", "false", "False")
-        # r8i4 zsplit escape (read ONCE here, at plugin init -- never per
+        # rki4 zsplit escape (read ONCE here, at plugin init -- never per
         # call).  Explicit LOCKS_CONFIG / overrides win.
-        _z = os.environ.get("LOCKS_R8I4_Z")
-        if _z is not None and "r8i4_zsplit" not in data:
-            data["r8i4_zsplit"] = int(_z)
+        _z = os.environ.get("LOCKS_RKI4_Z")
+        if _z is not None and "rki4_zsplit" not in data:
+            data["rki4_zsplit"] = int(_z)
         fields = {f.name for f in dataclasses.fields(cls)}
         unknown = set(data) - fields
         if unknown:

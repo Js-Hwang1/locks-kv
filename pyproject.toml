@@ -14,7 +14,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "locks-kv"
 version = "0.1.1"
-description = "LOCKS: Page-Local Compact Key Summaries for efficient long-context decoding -- an r8i4 page-summary KV selector for vLLM (GQA + MLA/DeepSeek; optional DRAM value tier)"
+description = "LOCKS: Page-Local Compact Key Summaries for efficient long-context decoding -- an rki4 page-summary KV selector for vLLM (GQA + MLA/DeepSeek; optional DRAM value tier)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"

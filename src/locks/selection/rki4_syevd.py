@@ -1,6 +1,6 @@
 """Direct cusolver ``Xsyevd`` (batched) with a PERSISTENT workspace.
 
-Drop-in for ``torch.linalg.eigh`` on the r8i4 page-grams (batched 16x16 fp32),
+Drop-in for ``torch.linalg.eigh`` on the rki4 page-grams (batched 16x16 fp32),
 BITWISE-identical to it -- same solver, same math, same selected pages -- but
 with the ~2.4 GiB cusolver workspace allocated ONCE and reused every build,
 instead of re-mapped per call (the cuMem* churn that dominates the summary
@@ -110,7 +110,7 @@ def _mod():
     if _MOD is None:
         from torch.utils.cpp_extension import load_inline
         _MOD = load_inline(
-            name="locks_r8i4_syevd", cpp_sources="", cuda_sources=_SRC,
+            name="locks_rki4_syevd", cpp_sources="", cuda_sources=_SRC,
             extra_cuda_cflags=["-O3", _arch.arch_flag()],
             extra_ldflags=["-lcusolver"], with_cuda=True, verbose=False)
     return _MOD
