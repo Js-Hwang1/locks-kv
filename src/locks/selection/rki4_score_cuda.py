@@ -1269,6 +1269,213 @@ void rki4_score_kernel(
 #endif  // RKI4_MMA_PFR
         }
 #else   // !RKI4_MMA_AOS: six-array addressing
+#if defined(LOCKS_RANKMAP) && RNK < 8
+        // ================= LEVER B: rank-tuned MLP map ==================== //
+        // Confirmed lever (PF probe): v4->mma is the EXPOSED critical-path load
+        // (long_scoreboard 0.42; prefetch hides it). Unroll-and-jam KJ pages/
+        // warp: HOIST all KJ pages' v4 loads together (latencies overlap), then
+        // mma+tile each page serially (reuse qt_sh). Page 0's v4 gates its mma;
+        // pages 1..KJ-1 see their v4 latency HIDDEN under the earlier pages'
+        // mma+tile -> memory-level parallelism depth KJ. Lower rank -> deeper KJ
+        // (fewer real basis => more pages affordable). Fold in the dead-lane v4
+        // SKIP: only gidm<RNK issue the v4 load (dead mma cols are epilogue-
+        // masked to 0), cutting r2's v4 requests to 2/8. Each page's mma+tile is
+        // byte-identical to the deployed loop, just interleaved -> score_h
+        // BITWISE (r8_lo == BIAS acc-qsum). KJ tunable via LOCKS_RANKMAP_KJ.
+        (void)Sp_a; (void)Sp_b; (void)p_mu; (void)p_c8; (void)p_cs;
+        (void)p_mus; (void)p_v4; (void)p_vs; (void)qtw; (void)PF;
+#ifdef LOCKS_RANKMAP_KJ
+        constexpr int KJ = LOCKS_RANKMAP_KJ;           // grind override (-D)
+#else
+        // KJ=1 the measured sweet spot (in-situ 256k h03, r2): the entire win
+        // is the dead-lane v4 SKIP (r2 -6.96%, 48 regs -> 10 blocks/SM), NOT the
+        // unroll-jam MLP -- at 256k (many waves) v4 latency is already hidden
+        // inter-warp so MLP is redundant, and deeper KJ only costs registers
+        // (KJ=2 1.2663 @9 blocks, KJ>=4 REGRESSES +24% @7 blocks). r4's 4/8 skip
+        // is too small to beat the loop overhead (RANKMAP not beneficial at r4).
+        constexpr int KJ = 1;                          // default pages/iter
+#endif
+        for (int pp = wid; pp < P; pp += KJ * nworker) {
+            long rowk[KJ];
+            unsigned cwk[KJ][4];
+            bool hask[KJ];
+            #pragma unroll
+            for (int k = 0; k < KJ; ++k) {
+                const int ppk = pp + k * nworker;
+                hask[k] = (ppk < P);                   // warp-uniform
+                rowk[k] = hask[k] ? row_of(ppk) : 0L;
+                // dead-lane v4 SKIP + hoisted load (MLP): only gidm<RNK load.
+                if (gidm < RNK && hask[k]) {
+                    const unsigned* pv = reinterpret_cast<const unsigned*>(
+                        v4 + (rowk[k] * RNK + gidm) * (DHEAD / 2)) + t4m;
+                    cwk[k][0] = __ldg(pv);      cwk[k][1] = __ldg(pv + 4);
+                    cwk[k][2] = __ldg(pv + 8);  cwk[k][3] = __ldg(pv + 12);
+                } else {
+                    cwk[k][0] = 0u; cwk[k][1] = 0u; cwk[k][2] = 0u; cwk[k][3] = 0u;
+                }
+            }
+            const long Sbase = (((long)r * n_kv + kh) * G + gl) * MP;
+            #pragma unroll
+            for (int k = 0; k < KJ; ++k) {
+                if (!hask[k]) continue;                 // warp-uniform tail
+                const long row = rowk[k];
+                const uint4* q_mu = reinterpret_cast<const uint4*>(
+                    mu8 + row * DHEAD) + rr * (MUW / 4);
+                #pragma unroll
+                for (int j = 0; j < MUW / 4; ++j) {
+                    const uint4 m4 = __ldg(q_mu + j);
+                    mm[4*j+0]=m4.x; mm[4*j+1]=m4.y; mm[4*j+2]=m4.z; mm[4*j+3]=m4.w;
+                }
+                const int8_t* q_c8 = c8 + (row * PGT + rr) * RNK;
+                const __nv_bfloat16* q_cs = cs + row * PGT + rr;
+                #pragma unroll
+                for (int tt = 0; tt < PGT / 8; ++tt) {
+#if RNK == 4
+                    cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
+                        q_c8 + (8 * tt) * RNK));
+#else
+                    cc[tt].x = (unsigned)__ldg(reinterpret_cast<
+                        const unsigned short*>(q_c8 + (8 * tt) * RNK));
+#endif
+                    cc[tt].y = 0u;
+                    sc[tt] = q_cs[8 * tt];
+                }
+                smu = mus[row];
+                int acc[4] = {0, 0, 0, 0};
+                unsigned b[2];
+                b[0]=r8_lo(cwk[k][0]); b[1]=r8_lo(cwk[k][1]); r8_mma_s8(acc, Af[0], b);
+                b[0]=r8_lo(cwk[k][2]); b[1]=r8_lo(cwk[k][3]); r8_mma_s8(acc, Af[1], b);
+                b[0]=r8_hi(cwk[k][0]); b[1]=r8_hi(cwk[k][1]); r8_mma_s8(acc, Af[2], b);
+                b[0]=r8_hi(cwk[k][2]); b[1]=r8_hi(cwk[k][3]); r8_mma_s8(acc, Af[3], b);
+                const int c0 = (2 * t4m + 0 < RNK) ? acc[0] : 0;
+                const int c1 = (2 * t4m + 1 < RNK) ? acc[1] : 0;
+                const int svc2 = (2 * t4m < RNK) ? 2 * t4m : 0;
+                const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(
+                    vs + row * RNK + svc2);
+                qtw[0] = (float)c0 * qsc_m * __bfloat162float(sv2.x);
+                qtw[1] = (float)c1 * qsc_m * __bfloat162float(sv2.y);
+                __syncwarp();
+                float* Spa = S + Sbase + (pp + k * nworker);
+                const float hsa = tile(qt_a, q8d_a, qsc_a, Spa, K_a);
+                float hsb = -CUDART_INF_F;
+                if constexpr (G8)
+                    hsb = tile(qt_b, q8d_b, qsc_b, Spa + (long)BOFF * MP, K_b);
+                if (hmax_pub != nullptr) {
+                    hm_a = fmaxf(hm_a, hsa); hm_b = fmaxf(hm_b, hsb);
+                }
+                __syncwarp();
+            }
+        }
+#elif defined(RKI4_PACK)
+        // ============ r4 PAGE-PACK: 2 pages/warp fill all 8 mma cols ======= //
+        // The m16n8k32 mma has n=8 basis columns FIXED by the instruction, so a
+        // rank-4 summary leaves 4 DEAD columns and issues the SAME mma as rank
+        // 8 -- the rank-independent compute wall that makes r4 no faster than
+        // r8. PACK loads page0's 4 basis into cols 0-3 (gidm<RNK) and page1's 4
+        // basis into cols 4-7 (gidm>=RNK); the shared query A-fragment (Af,
+        // rows=heads) projects BOTH pages in ONE mma. Output col j = <q_head,
+        // basis-col-j> lands at qt_sh[head][j] verbatim -- cols 0-3 -> page0,
+        // 4-7 -> page1 -- so the write pointer (qtw = &qt_sh[warp][gidm][2*t4m])
+        // is unchanged; the tile reads page0 at qt base +0 and page1 at +RNK.
+        // int8*int8 mma is exact and column-order-invariant, so each page's
+        // score_h is BITWISE the rank-4 single-page value (gate_pack_mma.py).
+        // Minimal six-slab variant only (no BIAS/PEEL/LSE2/MUC/FLAT/AOS/PFR).
+#if RNK != 4
+#error "RKI4_PACK: the 2-page pack requires RNK==4 (8/RNK==2 pages/warp)"
+#endif
+        (void)Sp_a; (void)Sp_b; (void)p_mu; (void)p_c8; (void)p_cs;
+        (void)p_mus; (void)p_v4; (void)p_vs; (void)gvc; (void)svc; (void)PF;
+        for (int pp = wid; pp < P; pp += 2 * nworker) {
+            const int pp0 = pp, pp1 = pp + nworker;
+            const bool has1 = (pp1 < P);          // warp-uniform (pp,P uniform)
+            const long row0 = row_of(pp0);
+            const long row1 = has1 ? row_of(pp1) : row0;
+            // (2) mma projection: page0 basis -> cols 0-3, page1 -> cols 4-7.
+            const long rowB  = (gidm < RNK) ? row0 : row1;
+            const int  bgidm = (gidm < RNK) ? gidm : (gidm - RNK);
+            const unsigned* pB = reinterpret_cast<const unsigned*>(
+                v4 + (rowB * RNK + bgidm) * (DHEAD / 2)) + t4m;
+            const unsigned cw0 = __ldg(pB),     cw1 = __ldg(pB + 4),
+                           cw2 = __ldg(pB + 8), cw3 = __ldg(pB + 12);
+            int acc[4] = {0, 0, 0, 0};
+            unsigned b[2];
+            b[0] = r8_lo(cw0); b[1] = r8_lo(cw1); r8_mma_s8(acc, Af[0], b);
+            b[0] = r8_lo(cw2); b[1] = r8_lo(cw3); r8_mma_s8(acc, Af[1], b);
+            b[0] = r8_hi(cw0); b[1] = r8_hi(cw1); r8_mma_s8(acc, Af[2], b);
+            b[0] = r8_hi(cw2); b[1] = r8_hi(cw3); r8_mma_s8(acc, Af[3], b);
+            const int c0 = acc[0], c1 = acc[1];   // all 8 cols REAL -> no mask
+            // V-scale + qt col: cols 0-3 (t4m<2) page0, cols 4-7 page1.
+            const bool colP1 = (2 * t4m >= RNK);
+            const long rowV  = colP1 ? row1 : row0;
+            const int  bcol  = colP1 ? (2 * t4m - RNK) : (2 * t4m);
+            const __nv_bfloat162 sv2 = *reinterpret_cast<const __nv_bfloat162*>(
+                vs + rowV * RNK + bcol);
+            // output col = 2*t4m (0-7): natural layout, cols 0-3 in [head][0..3]
+            // (page0), 4-7 in [head][4..7] (page1). qtw is unchanged.
+            qtw[0] = (float)c0 * qsc_m * __bfloat162float(sv2.x);
+            qtw[1] = (float)c1 * qsc_m * __bfloat162float(sv2.y);
+            __syncwarp();
+            const long Sbase = (((long)r * n_kv + kh) * G + gl) * MP;
+            // (3a) page0 tokens (row0) + tile -> S[pp0]
+            {
+                const uint4* q_mu = reinterpret_cast<const uint4*>(
+                    mu8 + row0 * DHEAD) + rr * (MUW / 4);
+                #pragma unroll
+                for (int j = 0; j < MUW / 4; ++j) {
+                    const uint4 m4 = __ldg(q_mu + j);
+                    mm[4*j+0]=m4.x; mm[4*j+1]=m4.y; mm[4*j+2]=m4.z; mm[4*j+3]=m4.w;
+                }
+                const int8_t* q_c8 = c8 + (row0 * PGT + rr) * RNK;
+                const __nv_bfloat16* q_cs = cs + row0 * PGT + rr;
+                #pragma unroll
+                for (int tt = 0; tt < PGT / 8; ++tt) {
+                    cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
+                        q_c8 + (8 * tt) * RNK));
+                    cc[tt].y = 0u;
+                    sc[tt] = q_cs[8 * tt];
+                }
+                smu = mus[row0];
+                float* S0a = S + Sbase + pp0;
+                const float hsa = tile(qt_a, q8d_a, qsc_a, S0a, K_a);
+                float hsb = -CUDART_INF_F;
+                if constexpr (G8)
+                    hsb = tile(qt_b, q8d_b, qsc_b, S0a + (long)BOFF * MP, K_b);
+                if (hmax_pub != nullptr) {
+                    hm_a = fmaxf(hm_a, hsa); hm_b = fmaxf(hm_b, hsb);
+                }
+            }
+            // (3b) page1 tokens (row1) + tile -> S[pp1]  (skip the odd tail)
+            if (has1) {
+                const uint4* q_mu = reinterpret_cast<const uint4*>(
+                    mu8 + row1 * DHEAD) + rr * (MUW / 4);
+                #pragma unroll
+                for (int j = 0; j < MUW / 4; ++j) {
+                    const uint4 m4 = __ldg(q_mu + j);
+                    mm[4*j+0]=m4.x; mm[4*j+1]=m4.y; mm[4*j+2]=m4.z; mm[4*j+3]=m4.w;
+                }
+                const int8_t* q_c8 = c8 + (row1 * PGT + rr) * RNK;
+                const __nv_bfloat16* q_cs = cs + row1 * PGT + rr;
+                #pragma unroll
+                for (int tt = 0; tt < PGT / 8; ++tt) {
+                    cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
+                        q_c8 + (8 * tt) * RNK));
+                    cc[tt].y = 0u;
+                    sc[tt] = q_cs[8 * tt];
+                }
+                smu = mus[row1];
+                float* S1a = S + Sbase + pp1;
+                const float hsa = tile(qt_a + RNK, q8d_a, qsc_a, S1a, K_a);
+                float hsb = -CUDART_INF_F;
+                if constexpr (G8)
+                    hsb = tile(qt_b + RNK, q8d_b, qsc_b,
+                               S1a + (long)BOFF * MP, K_b);
+                if (hmax_pub != nullptr) {
+                    hm_a = fmaxf(hm_a, hsa); hm_b = fmaxf(hm_b, hsb);
+                }
+            }
+            __syncwarp();      // qt_sh reuse next iteration
+        }
+#else
         // ---- Fix 1: depth-1 software pipeline of the dominant v4 load ----- //
         // ncu (DEPLOYED kernel, 256K/bs4): long_scoreboard 6.22 (~4x the next
         // stall), issue_active 63%, DRAM 27% SOL, occupancy 47% @ 1 wave,
@@ -1479,19 +1686,57 @@ void rki4_score_kernel(
                 p_vs = vs + row * RNK + svc;
             }
             // (1) per-(lane=rr) mu / C / cs / mus loads (same addresses)
+            // PROBE (diagnostic, default-OFF): LOCKS_PROBE_SKIP_{MU,C8,V4}
+            // replace one slab's global loads with 0 so ncu t_requests reveals
+            // that slab's share of the (rank-independent) load-instruction
+            // count. RNK==8 SASS byte-identical when no probe flag is set.
             #pragma unroll
             for (int j = 0; j < MUW / 4; ++j) {
+#ifdef LOCKS_PROBE_SKIP_MU
+                const uint4 m4 = make_uint4(0u, 0u, 0u, 0u);
+#else
                 const uint4 m4 = __ldg(p_mu + j);
+#endif
                 mm[4*j+0]=m4.x; mm[4*j+1]=m4.y; mm[4*j+2]=m4.z; mm[4*j+3]=m4.w;
             }
+#if defined(LOCKS_C8RELAY) && RNK == 2
+            // C' (RNK==2): the build (rki4_build _write_post, gated
+            // LOCKS_C8RELAY) relaid c8 so lane rr's two tokens (rr, rr+8) sit
+            // ADJACENTLY at positions 2rr, 2rr+1. ONE aligned 4-byte load
+            // (p_c8 + rr*RNK == c8 row + (2rr)*RNK) fetches BOTH -> HALVES the
+            // c8 requests (the count-cut lever, not width). tt=0 -> low 16 bits
+            // (token rr), tt=1 -> high (token rr+8). Same codes/order = bitwise.
+            const unsigned c8relw = __ldg(
+                reinterpret_cast<const unsigned*>(p_c8 + rr * RNK));
+#endif
             #pragma unroll
             for (int tt = 0; tt < PGT / 8; ++tt) {
-#if RNK == 8
+#ifdef LOCKS_PROBE_SKIP_C8
+                cc[tt].x = 0u; cc[tt].y = 0u;
+#elif RNK == 8
                 cc[tt] = __ldg(reinterpret_cast<const uint2*>(
                     p_c8 + (8 * tt) * RNK));
 #elif RNK == 4
                 cc[tt].x = __ldg(reinterpret_cast<const unsigned*>(
                     p_c8 + (8 * tt) * RNK));
+                cc[tt].y = 0u;
+#elif defined(LOCKS_C8RELAY)
+                cc[tt].x = (c8relw >> (tt * 16)) & 0xFFFFu;
+                cc[tt].y = 0u;
+#elif defined(LOCKS_C8WIDE)
+                // LEVER C (RNK==2): widen the 2-byte sub-word c8 code load to
+                // an ALIGNED 4-byte word + extract this token's 2 codes (low if
+                // the token index is even, high if odd). Removes the LDG.U16
+                // sub-word penalty (r2 = 17.6% of kernel time, top slab). No
+                // overread -- token 15 is odd so its word = tokens 14,15,
+                // in-page. Same codes, same lane->token, same LSE order ->
+                // BITWISE identical (gate_pack_mma --flag LOCKS_C8WIDE).
+                {
+                    const int tok = rr + 8 * tt;
+                    const unsigned w = __ldg(reinterpret_cast<const unsigned*>(
+                        p_c8 + (8 * tt) * RNK - (tok & 1) * RNK));
+                    cc[tt].x = (w >> ((tok & 1) * 16)) & 0xFFFFu;
+                }
                 cc[tt].y = 0u;
 #else
                 cc[tt].x = (unsigned)__ldg(reinterpret_cast<
@@ -1502,8 +1747,12 @@ void rki4_score_kernel(
             }
             smu = *p_mus;
             // (2) mma projection: qt[head][basis] for all 8x8 -> qt_sh
+#ifdef LOCKS_PROBE_SKIP_V4
+            const unsigned cw0 = 0u, cw1 = 0u, cw2 = 0u, cw3 = 0u;
+#else
             const unsigned cw0 = __ldg(p_v4),      cw1 = __ldg(p_v4 + 4),
                            cw2 = __ldg(p_v4 + 8),  cw3 = __ldg(p_v4 + 12);
+#endif
             int acc[4] = {0, 0, 0, 0};
             unsigned b[2];
 #ifdef RKI4_MMA_BIAS
@@ -1583,6 +1832,7 @@ void rki4_score_kernel(
             __syncwarp();      // qt_sh reuse next page
         }
         }   // end !BT / PGT!=16 original six-array loop (else of Fix 1)
+#endif  // RKI4_PACK
 #endif  // RKI4_MMA_AOS
 #else   // !RKI4_MMA_SRED: the shipped per-page addressing loop
         for (int pp = wid; pp < P; pp += nworker) {
@@ -2793,6 +3043,40 @@ def _get(verbose: bool = False):
         if _os.environ.get("LOCKS_PTXAS_V"):       # register/occupancy report
             _cf += ["-Xptxas=-v"]
         if _os.environ.get("RKI4_MMA"): _cf += ["-DRKI4_MMA"]
+        # RKI4_PACK (rank campaign v2, r4/r2 systems opt): pack 8/RNK pages per
+        # warp into the m16n8k32 mma's 8 fixed basis columns so a rank-4 summary
+        # fills all 8 columns (page0 -> cols 0-3, page1 -> cols 4-7) and issues
+        # HALF the (rank-independent) mma per page. Six-slab default variant
+        # only (RNK==4); the #ifdef leaves the RNK==8 SASS untouched.
+        if _os.environ.get("RKI4_PACK") or _os.environ.get("LOCKS_RKI4_PACK"):
+            _cf += ["-DRKI4_PACK"]
+        # PROBE flags (diagnostic, default-OFF): skip one slab's global loads so
+        # ncu t_requests attributes the rank-independent load-instruction count
+        # to slabs. Not a deployment path (scores are wrong); RNK==8 SASS
+        # byte-identical when unset.
+        for _pk in ("LOCKS_PROBE_SKIP_MU", "LOCKS_PROBE_SKIP_C8",
+                    "LOCKS_PROBE_SKIP_V4"):
+            if _os.environ.get(_pk):
+                _cf += [f"-D{_pk}"]
+        # LEVER C (RNK==2 only): aligned full-word c8 code load (kills the
+        # 2-byte sub-word penalty). RNK==8/4 paths + SASS byte-identical (the
+        # define is inert outside the RNK==2 branch).
+        if _os.environ.get("LOCKS_C8WIDE"):
+            _cf += ["-DLOCKS_C8WIDE"]
+        # C' (RNK==2 only): relaid c8 layout -- one aligned 4-byte load fetches
+        # lane rr's two tokens (rr, rr+8), HALVING c8 requests. MUST pair with
+        # the build's LOCKS_C8RELAY relay (rki4_build); r4/r8 + SASS unchanged
+        # (the define lives only in the RNK==2 elif branch).
+        if _os.environ.get("LOCKS_C8RELAY"):
+            _cf += ["-DLOCKS_C8RELAY"]
+        # LEVER B (RNK<8 only): rank-tuned MLP map -- unroll-and-jam KJ pages/
+        # warp with hoisted v4 loads + dead-lane skip, hiding the exposed v4
+        # latency. RNK==8 SASS byte-identical (the branch is RNK<8-gated).
+        # LOCKS_RANKMAP_KJ overrides the per-rank pages/iter for register tuning.
+        if _os.environ.get("LOCKS_RANKMAP"):
+            _cf += ["-DLOCKS_RANKMAP"]
+        if _kj := _os.environ.get("LOCKS_RANKMAP_KJ"):
+            _cf += [f"-DLOCKS_RANKMAP_KJ={int(_kj)}"]
         # BIAS landed DEFAULT-ON 2026-07-16 (byte-gate PASS + event-time win
         # -5.3%/-8.4% at 256K/1M on top of SRED: it shortens the dependent
         # chain off the stall-carrying cw load; SCORE_KERNEL_ISSUE_BOUND.md
