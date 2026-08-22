@@ -20,7 +20,7 @@ from .config import LocksConfig  # noqa: F401
 
 __all__ = ["LocksConfig", "register"]
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 
 def register() -> None:

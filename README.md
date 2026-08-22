@@ -4,15 +4,12 @@
 gives each KV *page* a compact, query-independent summary of its keys (the `rki4`
 low-rank int-4 page summary) and, at every decode step, attends only the top-`b`
 pages that summary ranks highest per (layer, KV-head) -- always keeping the sink
-and most-recent pages. Because the summary tracks each page's *exact* attention
+and most-recent pages. Because the summary closely reconstructs each page's attention
 mass, a small working set (often 5-13% of the cache) reproduces full-attention
 quality: LOCKS stays **within ~1 point of FullKV** at budgets where prior
 selectors and evictors lose **7-30+ points**. Prefill is untouched, so
 time-to-first-token is unchanged. A single `locks.register()` serves both **GQA**
 models (Llama, Qwen, GLM) and **MLA** models (DeepSeek V2/V3/V3.2).
-
-> **License note (provisional).** This release is distributed under Apache-2.0 as
-> a placeholder pending final confirmation by the authors. See `LICENSE`.
 
 ## Highlights
 
@@ -119,8 +116,9 @@ is one `LocksConfig`, given via the `LOCKS_CONFIG` env var (inline JSON, or a pa
 to a JSON/YAML file):
 
 ```bash
-# GQA model (Llama/Qwen/GLM): adaptive per-head coverage over exact page masses.
-export LOCKS_CONFIG='{"variant": "fast", "coverage": 0.95}'
+# GQA model (Llama/Qwen/GLM): fixed per-(layer,kv-head) page budget (the main rki4 path).
+# budget_pages = selected pages; 128 pages = a 2048-token budget at page size 16.
+export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 128}'
 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 # MLA model (DeepSeek V2/V3/V3.2): same plugin, fixed page budget.
@@ -128,7 +126,7 @@ export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 128, "window_pages": 10
 vllm serve deepseek-ai/DeepSeek-V2-Lite-Chat --trust-remote-code
 
 # The memory play: offload V to DRAM, keep K resident (GQA).
-export LOCKS_CONFIG='{"variant": "mem-v", "coverage": 0.95}'
+export LOCKS_CONFIG='{"variant": "mem-v", "budget_pages": 128}'
 
 # Turn LOCKS off (stock attention / FullKV reference line):
 export LOCKS_DISABLE=1
@@ -141,7 +139,7 @@ the LOCKS MLA backend. You can also register explicitly from Python:
 
 ```python
 import locks
-locks.register()               # or locks.register({"variant": "fast", "coverage": 0.95})
+locks.register()               # or locks.register({"variant": "fast", "budget_pages": 128})
 ```
 
 ### Configuration (`LocksConfig`)
@@ -149,16 +147,16 @@ locks.register()               # or locks.register({"variant": "fast", "coverage
 | field | meaning | default |
 |---|---|---|
 | `variant` | `fast` (K+V resident), `mem-v` (V in DRAM), `mem-kv` (K+V in DRAM) | `fast` |
-| `coverage` | adaptive per-head nucleus coverage over exact page masses (GQA) | `0.95` |
-| `budget` | fixed selected-page **fraction** (overrides `coverage`) | none |
-| `budget_pages` | fixed **absolute** pages per unit (overrides both; required for MLA) | none |
+| `budget_pages` | fixed **absolute** SELECTED pages per (layer,kv-head), EXCLUDING the always-attended sink/recent (total attended = `budget_pages` + `sink_pages` + `window_pages`); the main knob | none |
+| `budget` | fixed selected-page **fraction** of the selectable region (alternative to `budget_pages`) | none |
+| `coverage` | **legacy**; the main path is fixed-budget. If set alone (no `budget`/`budget_pages`) selection falls back to a **fixed 0.1 fraction** -- it is NOT adaptive | `0.95` |
 | `sink_pages` / `window_pages` | always-kept first / recent pages | `1` / `1` |
 | `r8_rank` | rank of the page summary | `8` |
 | `quad_combine` | GQA group combine: `nrm` (peak-normalized mass sum) or `max` | `nrm` |
 | `use_cuda` | hand-CUDA hot path vs Triton reference | `true` |
 
 Note: MLA currently supports the `fast` variant with a fixed budget
-(`budget_pages` / `budget`); adaptive coverage and the DRAM tier are GQA-only.
+(`budget_pages` / `budget`); the DRAM tier is GQA-only.
 
 ## How it works
 
@@ -196,4 +194,4 @@ deployments pin themselves.
 
 ## License
 
-Apache-2.0 (provisional; see the note above). See `LICENSE` for the full text.
+Apache-2.0. See `LICENSE` for the full text.

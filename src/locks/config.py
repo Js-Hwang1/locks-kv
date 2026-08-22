@@ -31,7 +31,9 @@ class LocksConfig:
     variant: Variant = "fast"
 
     # ---- Stage A: decode-time page selection ----------------------------- #
-    # Adaptive per-head nucleus coverage over EXACT page masses (flagship).
+    # (legacy) coverage knob. The main path is fixed-budget; if set without a
+    # budget/budget_pages, selection falls back to a FIXED 0.1 fraction (builder.py)
+    # -- it is NOT adaptive. Scores are RECONSTRUCTED page masses, not exact.
     coverage: float = 0.95
     # Alternative to coverage: a fixed per-step selected-page FRACTION (1-cr).
     # When set, overrides `coverage`.
