@@ -2,7 +2,7 @@
 
 **Page-Local Compact Key Summaries for efficient long-context decoding.** LOCKS
 gives each KV *page* a compact, query-independent summary of its keys (the `rki4`
-rank-8 int-4 page summary) and, at every decode step, attends only the top-`b`
+low-rank int-4 page summary) and, at every decode step, attends only the top-`b`
 pages that summary ranks highest per (layer, KV-head) -- always keeping the sink
 and most-recent pages. Because the summary tracks each page's *exact* attention
 mass, a small working set (often 5-13% of the cache) reproduces full-attention
@@ -39,21 +39,21 @@ read-every-key ceiling). Full protocol, roster and ablations are in the paper.
 
 **RULER-16K** (Llama-3.1-8B, 13-task mean). FullKV = **94.3**.
 
-| `b` | FullKV | Oracle | **LOCKS** | Quest | KVzip | ShadowKV | RocketKV |
-|----:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 64   | 94.3 | 80.0 | **78.1** | 39.5 | 21.7 | -    | 69.4 |
-| 128  | 94.3 | 87.5 | **87.4** | 57.8 | 23.2 | -    | 85.2 |
-| 512  | 94.3 | 91.5 | **91.4** | 79.3 | 67.2 | 84.5 | 89.6 |
-| 2048 | 94.3 | 93.7 | **93.7** | 90.3 | 91.3 | 92.5 | 93.1 |
+| `b` | FullKV | Oracle | **LOCKS** | Quest | ShadowKV | RocketKV |
+|----:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 64   | 94.3 | 80.0 | **78.1** | 39.5 | -    | 69.4 |
+| 128  | 94.3 | 87.5 | **87.4** | 57.8 | -    | 85.2 |
+| 512  | 94.3 | 91.5 | **91.4** | 79.3 | 84.5 | 89.6 |
+| 2048 | 94.3 | 93.7 | **93.7** | 90.3 | 92.5 | 93.1 |
 
 **LongBench-v1** (Llama-3.1-8B, 14-subset mean). FullKV = **47.0**.
 
-| `b` | FullKV | Oracle | **LOCKS** | Quest | KVzip | ShadowKV | RocketKV |
-|----:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 64   | 47.0 | 45.9 | **45.7** | 31.6 | 36.6 | -    | 41.6 |
-| 128  | 47.0 | 46.6 | **46.7** | 39.8 | 38.2 | -    | 44.1 |
-| 512  | 47.0 | 46.8 | **47.1** | 45.9 | 43.9 | 46.3 | 46.6 |
-| 2048 | 47.0 | 47.1 | **47.2** | 46.9 | 47.0 | 46.9 | 46.9 |
+| `b` | FullKV | Oracle | **LOCKS** | Quest | ShadowKV | RocketKV |
+|----:|:---:|:---:|:---:|:---:|:---:|:---:|
+| 64   | 47.0 | 45.9 | **45.7** | 31.6 | -    | 41.6 |
+| 128  | 47.0 | 46.6 | **46.7** | 39.8 | -    | 44.1 |
+| 512  | 47.0 | 46.8 | **47.1** | 45.9 | 46.3 | 46.6 |
+| 2048 | 47.0 | 47.1 | **47.2** | 46.9 | 46.9 | 46.9 |
 
 **Reasoning: MATH-500** (Qwen3-4B, thinking on, avg@4). FullKV = **94.0**.
 
@@ -172,7 +172,7 @@ Note: MLA currently supports the `fast` variant with a fixed budget
 - **Sparse decode.** A paged-attention kernel reads only the selected pages plus
   the always-kept sink and recent window. Prefill is untouched (TTFT parity).
 - **MLA.** For DeepSeek latent attention the same idea applies to the latent
-  cache: a local rank-8 summary over each page's `c_KV` block plus the exact
+  cache: a local low-rank summary over each page's `c_KV` block plus the exact
   decoupled RoPE term, max-unioned over the query heads, top-`b` selected. Only
   the decode seam is overridden, so prefill stays stock.
 - **Optional DRAM tier (Stage B).** `mem-v` / `mem-kv` offload V (or K+V) to a
