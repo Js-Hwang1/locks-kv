@@ -117,16 +117,18 @@ to a JSON/YAML file):
 
 ```bash
 # GQA model (Llama/Qwen/GLM): fixed per-(layer,kv-head) page budget (the main rki4 path).
-# budget_pages = selected pages; 128 pages = a 2048-token budget at page size 16.
-export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 128}'
+# budget_pages counts SELECTED pages only, EXCLUDING the always-attended sink +
+# recent: 126 + 1 sink + 1 recent = 128 pages = 2048 tokens at page size 16
+# (the paper's b). Raise budget_pages to attend more.
+export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 126, "sink_pages": 1, "window_pages": 1}'
 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
-# MLA model (DeepSeek V2/V3/V3.2): same plugin, fixed page budget.
-export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 128, "window_pages": 10}'
+# MLA model (DeepSeek V2/V3/V3.2): same plugin, same fixed page budget.
+export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 126, "sink_pages": 1, "window_pages": 1}'
 vllm serve deepseek-ai/DeepSeek-V2-Lite-Chat --trust-remote-code
 
 # The memory play: offload V to DRAM, keep K resident (GQA).
-export LOCKS_CONFIG='{"variant": "mem-v", "budget_pages": 128}'
+export LOCKS_CONFIG='{"variant": "mem-v", "budget_pages": 126}'
 
 # Turn LOCKS off (stock attention / FullKV reference line):
 export LOCKS_DISABLE=1
@@ -139,7 +141,7 @@ the LOCKS MLA backend. You can also register explicitly from Python:
 
 ```python
 import locks
-locks.register()               # or locks.register({"variant": "fast", "budget_pages": 128})
+locks.register()               # or locks.register({"variant": "fast", "budget_pages": 126})
 ```
 
 ### Configuration (`LocksConfig`)
