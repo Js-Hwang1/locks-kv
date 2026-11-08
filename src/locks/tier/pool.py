@@ -1,97 +1,169 @@
-"""MappedHostVPool -- the pinned, device-mapped host V pool (UVA zero-copy).
-
-The memory play: the full-precision V of every physical KV block lives in cheap
-HOST DRAM, mapped into the GPU address space (cudaHostGetDevicePointer / UVA) so
-decode kernels can gather it zero-copy over PCIe. Only a bounded hot buffer +
-staging pool stay in VRAM (see residency.py / staging.py).
-
-SIZING DISCIPLINE (the flagged-bug boundary).
-  * This pinned pool is keyed by PHYSICAL block id and sized (L, NB, n_kv,
-    page, d) -- i.e. by ``num_gpu_blocks``. That is BY DESIGN and correct: this
-    is HOST DRAM, the offload TARGET; it must hold the exact V bits of every
-    physical block that could be live, so any flushed page is retrievable (I1).
-    Host DRAM is abundant and cheap, which is the entire point of the tier.
-  * The flagged 17GiB bug was sizing VRAM-RESIDENT per-block state by
-    ``num_gpu_blocks`` (the fast path's R8State: r8_Vk was L*NB*n_kv*d*r int8).
-    The tier NEVER does that: its VRAM structures (the hot buffer, the staging
-    v_pool) are bounded to the WORKING SET (hot_slots S, v_blocks NV), NOT NB;
-    the only NB-sized VRAM is the tiny int8/int32 residency bookkeeping
-    (~1-4 bytes/block), not KV-sized. See ``MappedHostVPool.vram_note``.
-  * ``max_pool_gb`` caps the HOST allocation and RAISES loudly rather than
-    silently truncating (a truncated pool would violate I1: some block's V would
-    have nowhere to live).
-
-Ported clean from the prototype ``vllm/kernels/dram_tier.py`` (MappedHostPool /
-host_device_pointer / DevPtrTensor); the debug/telemetry cruft is dropped.
-"""
 from __future__ import annotations
-
 import ctypes
 import glob
+import math
 import os
-
 import torch
 
-# --------------------------------------------------------------------------- #
-# libcudart -> cudaHostGetDevicePointer (UVA device address of pinned host mem) #
-# --------------------------------------------------------------------------- #
 _libcudart = None
 
 
 def _cudart():
-    """Load libcudart once and bind cudaHostGetDevicePointer. Searched on the
-    system paths plus the torch-bundled nvidia wheel (the container's stack)."""
     global _libcudart
     if _libcudart is not None:
         return _libcudart
     last = None
     names = ["libcudart.so", "libcudart.so.13", "libcudart.so.12"]
-    names += sorted(glob.glob(os.path.join(
-        os.path.dirname(torch.__file__), "..", "nvidia", "cuda_runtime", "lib",
-        "libcudart.so*")))
+    names += sorted(
+        glob.glob(
+            os.path.join(
+                os.path.dirname(torch.__file__),
+                "..",
+                "nvidia",
+                "cuda_runtime",
+                "lib",
+                "libcudart.so*",
+            )
+        )
+    )
     for name in names:
         try:
             lib = ctypes.CDLL(name)
             lib.cudaHostGetDevicePointer.restype = ctypes.c_int
             lib.cudaHostGetDevicePointer.argtypes = [
-                ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_uint,
+            ]
+            lib.cudaHostAlloc.restype = ctypes.c_int
+            lib.cudaHostAlloc.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_size_t,
+                ctypes.c_uint,
+            ]
+            lib.cudaFreeHost.restype = ctypes.c_int
+            lib.cudaFreeHost.argtypes = [ctypes.c_void_p]
+            lib.cudaDeviceSynchronize.restype = ctypes.c_int
+            lib.cudaDeviceSynchronize.argtypes = []
+            lib.cudaHostRegister.restype = ctypes.c_int
+            lib.cudaHostRegister.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_uint,
+            ]
+            lib.cudaHostUnregister.restype = ctypes.c_int
+            lib.cudaHostUnregister.argtypes = [ctypes.c_void_p]
             _libcudart = lib
             return lib
-        except (OSError, AttributeError) as exc:  # pragma: no cover
+        except (OSError, AttributeError) as exc:
             last = exc
     raise RuntimeError(f"could not load libcudart: {last}")
 
 
 def host_device_pointer(host_tensor: torch.Tensor) -> int:
-    """Device-side address of a pinned host tensor (UVA zero-copy).
-
-    For torch pinned memory under UVA this equals ``host_tensor.data_ptr()``, but
-    we still round-trip through ``cudaHostGetDevicePointer`` so a non-UVA / weird
-    allocator setup fails LOUDLY here instead of faulting inside a kernel."""
     if not host_tensor.is_pinned():
         raise ValueError("pool tensor must be pinned (pin_memory=True)")
     dptr = ctypes.c_void_p(0)
     rc = _cudart().cudaHostGetDevicePointer(
-        ctypes.byref(dptr), ctypes.c_void_p(host_tensor.data_ptr()), 0)
+        ctypes.byref(dptr), ctypes.c_void_p(host_tensor.data_ptr()), 0
+    )
     if rc != 0:
-        raise RuntimeError(f"cudaHostGetDevicePointer failed rc={rc} "
-                           "(pinned memory not device-mapped?)")
+        raise RuntimeError(
+            f"cudaHostGetDevicePointer failed rc={rc} (pinned memory not device-mapped?)"
+        )
     return dptr.value
 
 
+class _RegisteredPinnedOwner:
+    def __init__(self, nbytes, huge):
+        self.lib = _cudart()
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.libc.mmap.restype = ctypes.c_void_p
+        self.libc.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        self.libc.munmap.restype = ctypes.c_int
+        self.libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self.libc.madvise.restype = ctypes.c_int
+        self.libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        self.pointer = ctypes.c_void_p()
+        self.registered = False
+        page = os.sysconf("SC_PAGE_SIZE")
+        align = 536870912 if huge else page
+        size = (nbytes + page - 1) // page * page
+        raw = self.libc.mmap(None, size + align, 3, 34, -1, 0)
+        if raw in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), "mmap CPU KV store failed")
+        aligned = (raw + align - 1) // align * align
+        prefix = aligned - raw
+        suffix = align - prefix
+        if prefix:
+            assert self.libc.munmap(ctypes.c_void_p(raw), prefix) == 0
+        if suffix:
+            assert self.libc.munmap(ctypes.c_void_p(aligned + size), suffix) == 0
+        self.pointer = ctypes.c_void_p(aligned)
+        self.size = size
+        numa = ctypes.CDLL("libnuma.so.1", use_errno=True)
+        numa.mbind.restype = ctypes.c_long
+        numa.mbind.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_ulong,
+            ctypes.c_uint,
+        ]
+        mask = ctypes.c_ulong(1)
+        rc = numa.mbind(self.pointer, size, 2, ctypes.byref(mask), 64, 0)
+        if rc != 0:
+            raise OSError(ctypes.get_errno(), "mbind CPU node 0 failed")
+        rc = self.libc.madvise(self.pointer, size, 14 if huge else 15)
+        if rc != 0:
+            raise OSError(ctypes.get_errno(), "madvise host KV policy failed")
+
+    def register(self):
+        rc = self.lib.cudaHostRegister(self.pointer, self.size, 2)
+        if rc != 0:
+            raise RuntimeError(f"cudaHostRegister({self.size}) failed rc={rc}")
+        self.registered = True
+
+    def __del__(self):
+        if not self.pointer.value:
+            return
+        if self.registered:
+            if self.lib.cudaDeviceSynchronize() != 0:
+                return
+            if self.lib.cudaHostUnregister(self.pointer) != 0:
+                return
+        self.libc.munmap(self.pointer, self.size)
+        self.pointer.value = None
+
+
+def exact_pinned_zeros(shape, dtype):
+    nbytes = math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
+    allocator = "registered_huge"
+    assert allocator in ("cuda", "registered_base", "registered_huge")
+    owner = _RegisteredPinnedOwner(nbytes, huge=True)
+    buffer = (ctypes.c_ubyte * nbytes).from_address(owner.pointer.value)
+    buffer._owner = owner
+    tensor = torch.frombuffer(buffer, dtype=dtype).reshape(shape)
+    tensor.zero_()
+    if isinstance(owner, _RegisteredPinnedOwner):
+        owner.register()
+    if not tensor.is_pinned():
+        raise RuntimeError("CUDA host allocation was not recognized as pinned")
+    return tensor
+
+
 class DevPtrTensor:
-    """Duck-typed tensor: lets Triton / a raw-pointer kernel launch on a device
-    address that has no ``torch.Tensor`` wrapper.
-
-    Triton's JIT only needs ``.data_ptr()`` + ``.dtype`` from a tensor argument
-    (plus the pointer value for alignment specialization), so this is enough to
-    hand a device-mapped host pool to a kernel. The CUDA extension takes the raw
-    ``data_ptr()`` directly."""
-
     __slots__ = ("_ptr", "dtype", "device", "shape")
 
-    def __init__(self, ptr: int, dtype: torch.dtype, device: torch.device,
-                 shape=()):
+    def __init__(self, ptr: int, dtype: torch.dtype, device: torch.device, shape=()):
         self._ptr = int(ptr)
         self.dtype = dtype
         self.device = device
@@ -102,26 +174,6 @@ class DevPtrTensor:
 
 
 class MappedHostVPool:
-    """Pinned host V pool + its kernel-launchable device-pointer view.
-
-    Layout ``(L, NB, n_kv, page, d)`` -- L-major, then physical block, so a
-    (layer, block, kv-head) tile is contiguous. The pool address of a
-    (l, blk, kv) page is ``((l*NB + blk)*n_kv + kv) * page * d`` (element index),
-    matching the reference gather/flush kernels' ``pool_off`` arithmetic.
-
-    The device view is exposed as ``int16`` so kernels do PURE BIT copies (no
-    float canonicalization) -- V bytes must survive the host round-trip exactly
-    for byte-identical output vs the resident path (the equality gate).
-    """
-
-    # Documented pinned-alloc trap (LOCKS_MEM_RKI4.md B2): allocating X GiB of
-    # pinned pool consumes MORE than X GiB of host MemAvailable (the pinned
-    # allocation + torch's caching-host-allocator slack + the UVA mapping page
-    # tables). MEASURED on h200x8-03 (scratch_mem_rki4/bench_fetch.py): a 1 GiB
-    # pinned pool dropped MemAvailable by 2.90 GiB. Guard the allocation LOUDLY
-    # against MemAvailable at this factor instead of letting the OOM killer
-    # take the engine process. Conservative by design (refuses early); rerun
-    # bench_fetch on GH200 (C2C, Grace LPDDR) to recalibrate if it differs.
     HOST_OVERHEAD_FACTOR = 3.0
     HOST_SLACK_BYTES = 32 << 30
 
@@ -136,49 +188,57 @@ class MappedHostVPool:
             pass
         return 0
 
-    def __init__(self, *, num_layers: int, num_blocks: int, n_kv: int,
-                 page: int, d: int, dtype: torch.dtype = torch.bfloat16,
-                 device=None, max_pool_gb: float = 256.0):
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        num_blocks: int,
+        n_kv: int,
+        page: int,
+        d: int,
+        dtype: torch.dtype = torch.bfloat16,
+        device=None,
+        max_pool_gb: float = 256.0,
+    ):
         if dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(f"pool dtype must be bf16/fp16, got {dtype}")
-        self.L, self.NB, self.n_kv = num_layers, num_blocks, n_kv
-        self.page, self.d, self.dtype = page, d, dtype
+        (self.L, self.NB, self.n_kv) = (num_layers, num_blocks, n_kv)
+        (self.page, self.d, self.dtype) = (page, d, dtype)
         elem = torch.empty(0, dtype=dtype).element_size()
         pool_bytes = num_layers * num_blocks * n_kv * page * d * elem
         if pool_bytes > max_pool_gb * (1 << 30):
             raise RuntimeError(
-                f"pinned V pool would be {pool_bytes / 2**30:.1f} GiB "
-                f"(> cap max_pool_gb={max_pool_gb}); reduce num_gpu_blocks "
-                "(num_gpu_blocks_override) or raise LocksConfig.max_pool_gb. "
-                "NOTE this is HOST DRAM (the offload target), not VRAM.")
+                f"pinned V pool would be {pool_bytes / 2**30:.1f} GiB (> cap max_pool_gb={max_pool_gb}); reduce num_gpu_blocks (num_gpu_blocks_override) or raise LocksConfig.max_pool_gb. NOTE this is HOST DRAM (the offload target), not VRAM."
+            )
         avail = self._host_available_bytes()
-        need = int(pool_bytes * self.HOST_OVERHEAD_FACTOR) \
-            + self.HOST_SLACK_BYTES
+        exact = True
+        factor = 1.25 if exact else self.HOST_OVERHEAD_FACTOR
+        need = int(pool_bytes * factor) + self.HOST_SLACK_BYTES
         if avail and need > avail:
             raise RuntimeError(
-                f"pinned pool of {pool_bytes / 2**30:.1f} GiB needs "
-                f"~{need / 2**30:.1f} GiB host headroom (factor "
-                f"{self.HOST_OVERHEAD_FACTOR} + {self.HOST_SLACK_BYTES >> 30} "
-                f"GiB slack) but MemAvailable is {avail / 2**30:.1f} GiB -- "
-                "refusing (the ~2 GiB/GiB pinned OOM trap). Reduce "
-                "num_gpu_blocks_override / max_model_len or free host RAM.")
-        dev = torch.device(device) if device is not None else \
-            torch.device("cuda", torch.cuda.current_device())
-        # (L, NB, n_kv, page, d) pinned host allocation.
-        self.host = torch.zeros((num_layers, num_blocks, n_kv, page, d),
-                                dtype=dtype, pin_memory=True)
-        # int16 device view: bit-exact copies, no float canonicalize.
-        self.dev_view = DevPtrTensor(host_device_pointer(self.host),
-                                     torch.int16, dev, tuple(self.host.shape))
+                f"pinned pool of {pool_bytes / 2**30:.1f} GiB needs ~{need / 2**30:.1f} GiB host headroom (factor {factor} + {self.HOST_SLACK_BYTES >> 30} GiB slack) but MemAvailable is {avail / 2**30:.1f} GiB -- refusing. Reduce num_gpu_blocks_override / max_model_len or free host RAM."
+            )
+        dev = (
+            torch.device(device)
+            if device is not None
+            else torch.device("cuda", torch.cuda.current_device())
+        )
+        shape = (num_layers, num_blocks, n_kv, page, d)
+        if exact:
+            self.host = exact_pinned_zeros(shape, dtype)
+        else:
+            self.host = torch.zeros(shape, dtype=dtype, pin_memory=True)
+        self.dev_view = DevPtrTensor(
+            host_device_pointer(self.host), torch.int16, dev, tuple(self.host.shape)
+        )
+        self.allocation_kind = "registered_huge" if exact else "torch_caching_pinned"
+        self.allocation_requested_bytes = pool_bytes
+        self.guard_factor = factor
         self.pool_gib = pool_bytes / 2**30
         self.device = dev
 
-    # ---- offsets (element indices; kernels take the raw dev pointer) ------- #
     def page_offset(self, layer: int, blk: int, kv: int) -> int:
-        """Element offset of the (layer, block, kv-head) page in the pool."""
-        return (((layer * self.NB + blk) * self.n_kv + kv) * self.page * self.d)
+        return ((layer * self.NB + blk) * self.n_kv + kv) * self.page * self.d
 
     def vram_note(self) -> str:
-        """One-line reminder of the sizing discipline (used in logs)."""
-        return (f"host_pool={self.pool_gib:.2f}GiB (DRAM, keyed by NB={self.NB}; "
-                "VRAM hot/staging bounded to working set, see residency/staging)")
+        return f"host_pool={self.pool_gib:.2f}GiB (DRAM, keyed by NB={self.NB}; VRAM hot/staging bounded to working set, see residency/staging)"

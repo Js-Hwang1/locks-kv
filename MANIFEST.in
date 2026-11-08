@@ -1,23 +1,7 @@
-# MANIFEST.in -- controls what goes into the sdist (.tar.gz). The wheel's
-# contents are governed by pyproject's package discovery (pure `.py` modules).
-
-# Project metadata.
 include README.md
 include LICENSE
 include MANIFEST.in
 include pyproject.toml
-
-# Ship every Python source under the package (the runtime CUDA kernels are
-# `.py` files that `load_inline` at import time, so they MUST be included).
-recursive-include src/locks *.py
-
-# Keep dev-only notes and byte-compiled / scratch junk out of the release.
-recursive-exclude src *.md
-global-exclude *.pyc
-global-exclude *.pyo
-global-exclude *.so
-global-exclude *~
-global-exclude __pycache__/*
+recursive-include src/locks *.py *.cu
+global-exclude *.pyc *.pyo *.so
 prune **/__pycache__
-prune **/scratch_*
-prune **/tmp_*

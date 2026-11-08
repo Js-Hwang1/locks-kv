@@ -1,11 +1,3 @@
-# pyproject.toml -- standalone release metadata for the LOCKS pip package.
-#
-# This tree is SELF-CONTAINED: it is not the research-repo root pyproject (that
-# one builds the separate `kvcomp` harness). `packaging/build.sh` stages a
-# snapshot of the live `src/locks` into `src/locks` next to this file, then
-# builds the sdist + wheel from here.
-#
-# Distribution name = `locks-kv` (PyPI). Import name = `locks` (`import locks`).
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]
@@ -13,8 +5,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "locks-kv"
-version = "0.1.4"
-description = "LOCKS: Page-Local Compact Key Summaries for efficient long-context decoding -- an rki4 page-summary KV selector for vLLM (GQA + MLA/DeepSeek; optional DRAM value tier)"
+version = "0.1.5.dev20261108"
+description = "LOCKS: Page-Local Compact Key Summaries for efficient long-context decoding -- optimized GQA and MLA page selection with optional host-backed GQA KV"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -39,43 +31,22 @@ classifiers = [
   "Environment :: GPU :: NVIDIA CUDA",
 ]
 
-# Runtime deps that are ALWAYS needed once you touch a kernel (the whole point
-# of the package). Kept minimal + floors-only so LOCKS drops into an existing
-# CUDA/torch deployment without fighting the resolver. `numpy` is intentionally
-# absent: nothing under `locks/` imports it directly (it arrives transitively
-# via torch). See README "Dependencies".
 dependencies = [
   "torch>=2.4",
   "triton>=3.0",
 ]
 
 [project.optional-dependencies]
-# vLLM is the plugin host. It is REQUIRED for the backend/plugin path but is a
-# heavy, CUDA-ABI-sensitive wheel that real deployments pin themselves, so we
-# ship it as an extra rather than a hard floor that could upgrade a pinned
-# engine out from under the user. Install LOCKS into your existing vLLM env, or
-# `pip install locks-kv[vllm]` to pull a compatible engine.
-vllm = ["vllm>=0.8"]
-# YAML `LOCKS_CONFIG` files (JSON configs work with no extra dep).
+vllm = ["vllm>=0.24,<0.25"]
 yaml = ["pyyaml>=6.0"]
-# `locks-bench e2e` tokenizes a real model (lazy `transformers` import); it also
-# needs the `vllm` extra to spin up an engine.
-bench = ["transformers>=4.40"]
-# Everything for the full plugin + bench + yaml experience.
-all = ["vllm>=0.8", "transformers>=4.40", "pyyaml>=6.0"]
+all = ["vllm>=0.24,<0.25", "transformers>=4.40", "pyyaml>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/Js-Hwang1/locks-kv"
 Repository = "https://github.com/Js-Hwang1/locks-kv"
 Issues = "https://github.com/Js-Hwang1/locks-kv/issues"
 
-# Console script: `locks-bench <kernels|e2e|all>`.
-[project.scripts]
-locks-bench = "locks.bench.cli:main"
 
-# vLLM general-plugin auto-registration: with the wheel installed, vLLM calls
-# this at engine startup with NO import needed in user code, and LOCKS patches
-# itself in as the attention backend.
 [project.entry-points."vllm.general_plugins"]
 locks = "locks.backend.register:register"
 
@@ -84,6 +55,4 @@ where = ["src"]
 include = ["locks*"]
 
 [tool.setuptools.package-data]
-# The CUDA kernels are `.py` sources compiled at runtime via `load_inline`, so
-# they ship as ordinary modules (no data files). Nothing extra to include.
-locks = []
+locks = ["selection/*.cu"]

@@ -1,199 +1,140 @@
 # LOCKS
 
-**Page-Local Compact Key Summaries for efficient long-context decoding.** LOCKS
-gives each KV *page* a compact, query-independent summary of its keys (the `rki4`
-low-rank int-4 page summary) and, at every decode step, attends only the top-`b`
-pages that summary ranks highest per (layer, KV-head) -- always keeping the sink
-and most-recent pages. Because the summary closely reconstructs each page's attention
-mass, a small working set (often 5-13% of the cache) reproduces full-attention
-quality: LOCKS stays **within ~1 point of FullKV** at budgets where prior
-selectors and evictors lose **7-30+ points**. Prefill is untouched, so
-time-to-first-token is unchanged. A single `locks.register()` serves both **GQA**
-models (Llama, Qwen, GLM) and **MLA** models (DeepSeek V2/V3/V3.2).
+LOCKS selects pages using compact key summaries and attends to the original KV.
+This package contains the canonical optimized implementation, with separate
+resident GQA, host-backed GQA, and resident MLA paths. Retired experimental
+kernels and eager reference selectors are not part of the runtime.
 
-## Highlights
+## Installation
 
-- **Lossless at small budgets.** Within ~1 pt of FullKV on LongBench-v1 and RULER
-  once `b >= 512`, and it *tracks the read-every-key oracle to under a point*
-  everywhere. It matches or exceeds FullKV at `b >= 512` on LongBench.
-- **Large margins over SoTA selectors** at tight budgets, where selection matters
-  most (see [Results](#results)).
-- **Reasoning-safe.** On MATH-500 / AIME26, LOCKS holds 91-94% where Quest, R-KV,
-  TriAttention and LazyEviction collapse below 45% at the *same* budget.
-- **MLA / DeepSeek.** Lossless on DeepSeek MLA in vLLM via the same plugin (the
-  KV cache is the MLA latent; LOCKS selects over it seamlessly).
-- **Faster where it counts.** bs=1 decode is at parity below ~30K context and up
-  to **2.0x** at 1M; batched decode reaches **1.8x**. Prefill/TTFT is unchanged.
-- **Small footprint.** The only added resident state is the summary, **~9-10% of
-  the KV cache** (~768-834 B per page per KV-head). An optional DRAM tier can
-  offload V (or K+V).
+The GQA runtime is validated on GH200 with Python 3.10, PyTorch 2.11.0+cu129,
+Triton 3.6.0, vLLM 0.24.0, and the CUDA 12.8 compiler. It requires Linux,
+an SM90 Hopper GPU, a CUDA compiler, and Ninja. Install into an existing
+compatible PyTorch/vLLM environment:
 
-## Results
-
-Same-engine, identical records, matched budget `b` (tokens per (layer, KV-head);
-page 16; sink + recent counted inside `b`). **Oracle** = exact-LSE selection (the
-read-every-key ceiling). Full protocol, roster and ablations are in the paper.
-
-**RULER-16K** (Llama-3.1-8B, 13-task mean). FullKV = **94.3**.
-
-| `b` | FullKV | Oracle | **LOCKS** | Quest | ShadowKV | RocketKV |
-|----:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 64   | 94.3 | 80.0 | **78.1** | 39.5 | -    | 69.4 |
-| 128  | 94.3 | 87.5 | **87.4** | 57.8 | -    | 85.2 |
-| 512  | 94.3 | 91.5 | **91.4** | 79.3 | 84.5 | 89.6 |
-| 2048 | 94.3 | 93.7 | **93.7** | 90.3 | 92.5 | 93.1 |
-
-**LongBench-v1** (Llama-3.1-8B, 14-subset mean). FullKV = **47.0**.
-
-| `b` | FullKV | Oracle | **LOCKS** | Quest | ShadowKV | RocketKV |
-|----:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 64   | 47.0 | 45.9 | **45.7** | 31.6 | -    | 41.6 |
-| 128  | 47.0 | 46.6 | **46.7** | 39.8 | -    | 44.1 |
-| 512  | 47.0 | 46.8 | **47.1** | 45.9 | 46.3 | 46.6 |
-| 2048 | 47.0 | 47.1 | **47.2** | 46.9 | 46.9 | 46.9 |
-
-**Reasoning: MATH-500** (Qwen3-4B, thinking on, avg@4). FullKV = **94.0**.
-
-| `b` | FullKV | Oracle | **LOCKS** | Quest | R-KV | TriAttention | LazyEviction |
-|----:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 64   | 94.0 | 56.0 | **54.5** | 1.5  | 5.0  | 11.5 | 0.5  |
-| 256  | 94.0 | 92.0 | **91.0** | 9.0  | 31.5 | 44.5 | 19.5 |
-| 1024 | 94.0 | 94.0 | **94.0** | 68.5 | 77.0 | 81.5 | 75.0 |
-| 2048 | 94.0 | 93.5 | **93.5** | 87.5 | 90.5 | 91.5 | 92.0 |
-
-Where value-blind evictors and score-based selectors discard the reasoning
-working set, LOCKS keeps it: at `b = 256` it scores **91.0** vs the best baseline's
-44.5. (AIME26 shows the same pattern; InfiniteBench at 100K+ context on
-GLM-4-9B-Chat-1M has LOCKS the highest measured mean of any deployable selector.)
-
-**MLA / DeepSeek-V2-Lite, RULER-16K** (vLLM 0.24, `b = 2048` = **12.5% attended**):
-
-| arm | attended | avg | vs FullKV |
-|---|:---:|:---:|:---:|
-| FullKV | 100% | 85.07 | - |
-| **LOCKS @2048** | 12.5% | **85.36** | **+0.29** |
-
-Lossless: LOCKS on the MLA latent is within noise of full attention.
-
-## Efficiency
-
-bs=1 decode TPOT, GLM-4-9B-Chat-1M, one H200 NVL, `b = 2048`, vs the *faster* of
-FA3 / FlashInfer:
-
-| context | dense (ms) | **LOCKS (ms)** | speedup |
-|--------:|:---:|:---:|:---:|
-| 16K  | 6.93  | 7.08  | 0.98x (parity) |
-| 64K  | 7.97  | 7.38  | 1.08x |
-| 128K | 8.74  | 8.27  | 1.06x |
-| 256K | 11.63 | 8.96  | **1.30x** |
-| 512K | 16.17 | 10.47 | **1.54x** |
-| 1M   | 26.19 | 12.95 | **2.02x** |
-
-Parity below ~30K, crossover ~30K, up to 2.02x at 1M (the hot path is
-bandwidth-bound and pulls ahead once the dense KV read dominates). Batched decode
-amplifies the gap: up to **1.80x at 256K / batch 4** on GLM. TTFT is at parity
-(prefill is byte-identical); the only one-time cost is the summary build
-(0.5s @ 16K -> 3.7s @ 1M).
-
-## Install
-
-```bash
-pip install locks-kv          # import name is `locks`
-pip install "locks-kv[vllm]"  # + a compatible vLLM engine
-pip install "locks-kv[all]"   # + transformers, pyyaml (YAML configs)
+```sh
+python -m pip install --no-deps .
 ```
 
-Requires Python >= 3.10 and an NVIDIA GPU. Hot-path CUDA kernels compile once at
-first use via `torch.utils.cpp_extension` (Hopper `sm_90a`); reference Triton
-kernels are the automatic fallback.
+Compiled extensions are built on first use. Compilation errors are reported;
+they do not switch execution to an eager reference implementation.
 
-## Quickstart
+## GQA configuration
 
-LOCKS installs as a vLLM **general plugin** and auto-registers at engine startup
-(entry point `locks = locks.backend.register:register`). It is **inert until you
-set `LOCKS_CONFIG`**, so a stock vLLM is unaffected until you opt in. Everything
-is one `LocksConfig`, given via the `LOCKS_CONFIG` env var (inline JSON, or a path
-to a JSON/YAML file):
+Provide `LOCKS_CONFIG` as a JSON object or a JSON/YAML file. The vLLM plugin
+remains inactive when no configuration is supplied. An explicit budget is
+required. One process uses one rank and KV mode; configure these before loading
+the model or importing selector state.
 
-```bash
-# GQA model (Llama/Qwen/GLM): fixed per-(layer,kv-head) page budget (the main rki4 path).
-# budget_pages counts SELECTED pages only, EXCLUDING the always-attended sink +
-# recent: 126 + 1 sink + 1 recent = 128 pages = 2048 tokens at page size 16
-# (the paper's b). Raise budget_pages to attend more.
-export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 126, "sink_pages": 1, "window_pages": 1}'
-vllm serve meta-llama/Llama-3.1-8B-Instruct
-
-# MLA model (DeepSeek V2/V3/V3.2): same plugin, same fixed page budget.
-export LOCKS_CONFIG='{"variant": "fast", "budget_pages": 126, "sink_pages": 1, "window_pages": 1}'
-vllm serve deepseek-ai/DeepSeek-V2-Lite-Chat --trust-remote-code
-
-# The memory play: offload V to DRAM, keep K resident (GQA).
-export LOCKS_CONFIG='{"variant": "mem-v", "budget_pages": 126}'
-
-# Turn LOCKS off (stock attention / FullKV reference line):
-export LOCKS_DISABLE=1
+```sh
+export LOCKS_CONFIG='{"variant":"fast","r8_rank":4,"budget_pages":126,"sink_pages":1,"window_pages":1}'
 ```
 
-The same `locks.register()` handles GQA and MLA: it patches vLLM's backend
-selector so that wherever vLLM would pick FlashAttention (GQA) it gets the LOCKS
-backend, and wherever it picks an MLA backend (DeepSeek latent attention) it gets
-the LOCKS MLA backend. You can also register explicitly from Python:
+Then construct a normal vLLM engine with the desired model, context length,
+batch size, BF16 KV, and block size. Alternatively, register programmatically
+before constructing the engine:
 
 ```python
 import locks
-locks.register()               # or locks.register({"variant": "fast", "budget_pages": 126})
+
+locks.register({
+    "variant": "fast",
+    "r8_rank": 4,
+    "budget_pages": 126,
+    "sink_pages": 1,
+    "window_pages": 1,
+})
 ```
 
-### Configuration (`LocksConfig`)
+`r8_rank` is the retained compatibility name for rank; supported native ranks
+are 2, 4, and 8. The GQA basis uses INT4, token coefficients use INT8, and the
+page centroid uses INT8 with BF16 scales. Native selection supports 16- and
+32-token pages and head dimensions 64, 128, and 256. The packed host-backed
+rank-4 path uses 16-token pages and head dimension 128.
 
-| field | meaning | default |
-|---|---|---|
-| `variant` | `fast` (K+V resident), `mem-v` (V in DRAM), `mem-kv` (K+V in DRAM) | `fast` |
-| `budget_pages` | fixed **absolute** SELECTED pages per (layer,kv-head), EXCLUDING the always-attended sink/recent (total attended = `budget_pages` + `sink_pages` + `window_pages`); the main knob | none |
-| `budget` | fixed selected-page **fraction** of the selectable region (alternative to `budget_pages`) | none |
-| `coverage` | **legacy**; the main path is fixed-budget. If set alone (no `budget`/`budget_pages`) selection falls back to a **fixed 0.1 fraction** -- it is NOT adaptive | `0.95` |
-| `sink_pages` / `window_pages` | always-kept first / recent pages | `1` / `1` |
-| `r8_rank` | rank of the page summary | `8` |
-| `quad_combine` | GQA group combine: `nrm` (peak-normalized mass sum) or `max` | `nrm` |
-| `use_cuda` | hand-CUDA hot path vs Triton reference | `true` |
+For GQA, `budget_pages` is the **dynamic** allowance. Sink and recent/current
+pages are additional reserved slots inside the intended total attended budget.
+At page size 16, 126 dynamic + 1 sink + 1 current = 128 pages = 2048 tokens per
+KV head. A 128-token total budget instead uses `budget_pages=6`. An incomplete
+current page consumes one slot and its nonexistent tokens are masked.
 
-Note: MLA currently supports the `fast` variant with a fixed budget
-(`budget_pages` / `budget`); the DRAM tier is GQA-only.
+Every GQA group receives one shared set of page IDs. Each query head's page-LSE
+scores are normalized over **all visible pages**, including sink/current;
+normalized shares are averaged across the group. Mandatory pages are then
+reserved and the dynamic allowance is filled by exact top-k. Ties favor lower
+page IDs. The current page is scored from its visible original keys, with the
+same native query INT8 round-trip as the summary scorer. Sparse attention uses
+original BF16 queries, keys, and values. Candidate-only normalization, peak
+normalization, and query-head unions are not runtime alternatives.
 
-## How it works
+## Host-backed GQA
 
-- **Selection (Stage A).** Each page carries a query-independent **rki4** summary
-  built when the page finalizes: an int-4 column-major basis + int8 coefficients +
-  an int8 page centroid, from the page-gram eigendecomposition. A query scores
-  every page directly (a per-head page-mass estimate) and a static top-`b` keeps
-  the highest-scoring pages per (layer, KV-head); the GQA group is combined by a
-  peak-normalized mass sum (`nrm`). No second exact pass. The summary is the only
-  added resident state, ~9-10% of the KV cache.
-- **Sparse decode.** A paged-attention kernel reads only the selected pages plus
-  the always-kept sink and recent window. Prefill is untouched (TTFT parity).
-- **MLA.** For DeepSeek latent attention the same idea applies to the latent
-  cache: a local low-rank summary over each page's `c_KV` block plus the exact
-  decoupled RoPE term, max-unioned over the query heads, top-`b` selected. Only
-  the decode seam is overridden, so prefill stays stock.
-- **Optional DRAM tier (Stage B).** `mem-v` / `mem-kv` offload V (or K+V) to a
-  pinned host-DRAM pool, keeping only the summary and the pages called each step
-  resident. Measured realized saving ~38% peak VRAM for the K-only engine cache;
-  the tier is opt-in and off by default.
+Use `variant="mem-kv"` to keep the complete K/V store in CPU memory, or
+`variant="mem-v"` to offload values while keeping keys resident. Set the
+capacity explicitly for reproducible measurements, for example with
+`hot_slots`, `v_blocks`, `max_pool_gb`, vLLM's context/batch limits, and its
+GPU-memory utilization limit.
 
-## Dependencies
+The full-KV path automatically uses compact engine identity handles, packed
+rank-4 summaries, registered CPU huge pages, exact host allocation sizes,
+guarded incremental staging, overlapped transfer scheduling, and attention
+metadata prefetch. Release/acquire publication and the eviction fence protect
+original K/V while transfers overlap decode. The allocator binds its host
+mapping to CPU NUMA node 0; the measured platform is GH200.
 
-| dependency | why | how declared |
-|---|---|---|
-| `torch` | tensors + runtime CUDA (`cpp_extension`) kernels | hard (`>=2.4`) |
-| `triton` | reference / fallback kernels | hard (`>=3.0`) |
-| `vllm` | plugin host + attention backend | extra `[vllm]` (`>=0.8`) |
-| `transformers` | tokenizers for bench/eval (lazy) | extra `[bench]` |
-| `pyyaml` | YAML `LOCKS_CONFIG` files (JSON needs no dep) | extra `[yaml]` |
+The rank-4 selector payload is 490 bytes per page per KV head; the packed
+physical record is 512 bytes including tags and padding. Rank-8's logical
+payload is 818 bytes. Do not equate payload bytes with total runtime memory.
 
-`numpy` is not a direct dependency (it arrives transitively via torch). vLLM is
-an extra, not a hard floor, because it is a heavy CUDA-ABI-sensitive wheel that
-deployments pin themselves.
+`rki4_zsplit` controls scorer grid partitioning without changing scores.
+The validated Table 3 settings use 9 at 64K/batch 58, 48 at 128K/batch 29,
+and 96 at 256K/batch 14, with a 2048-token total attended budget and the
+experiment's explicitly configured hot-cache capacities. Numerical parity
+does not imply identical performance at arbitrary ranks, batches, or devices.
 
-## License
+## MLA / DeepSeek
 
-Apache-2.0. See `LICENSE` for the full text.
+Resident MLA support is retained through `LocksMLABackend` and its fused
+Triton scorer over compact page-local latent factors. This preserves the
+repository's existing MLA score: the maximum reconstructed token logit across
+query heads, with exact RoPE-key contributions. It is a separate architecture
+path, **not** the GQA share-average/r4i4 representation. Its factors are FP32,
+and `budget_pages` is the total MLA page budget including sink/recent slots.
+These differences are explicit; no GQA paper result should be attributed to
+this MLA path.
+
+MLA uses the same optimized exact top-k implementation, selected original
+latent KV for attention, and the stock MLA prefill. The model's native DSA
+indexer is bypassed only when LOCKS is selected as its MLA backend. MLA
+offloading, FP8 latent KV, and DeepSeek V4's distinct attention architecture
+are not implemented by this adapter. Its fused scorer uses eager orchestration;
+it does not claim the GQA path's full-graph support. MLA integration validation is separate
+from the GH200/GLM performance measurements.
+
+## Source layout and validation
+
+- `src/locks/backend/`: vLLM registration, metadata, memory planning, GQA/MLA adapters.
+- `src/locks/selection/`: page-summary construction, native scoring, share-average,
+  and scalable exact top-k.
+- `src/locks/attention/`: resident sparse attention and split reduction.
+- `src/locks/tier/`: host storage, staging, cache residency, transfers, and offloaded attention.
+- `tests/`: independent reference calculations and regression checks.
+
+The pre-cleanup source is preserved on
+`archive/pre-optimized-canonical-20261108`. Accepted experiment snapshots are
+kept separately from this package; historical implementations are not bundled
+as alternative runtime paths.
+
+The regression checks require the compatible GPU environment above and an
+explicit report destination:
+
+```sh
+python tests/check_selection.py --report /tmp/locks_selection.json
+python tests/check_shared_average.py --report /tmp/locks_shared_average.json
+python tests/check_mla.py --report /tmp/locks_mla.json
+```
+
+The MLA check uses synthetic latent KV and does not establish full-model
+DeepSeek correctness or performance. The measured GLM configurations exercise
+resident GQA and complete host-backed KV; no new latency claim is made for
+the value-only offload mode.
