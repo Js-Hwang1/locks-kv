@@ -432,15 +432,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 self._layer_k = None
             else:
                 self._layer_k = [_split_kv(kvc)[0] for kvc in layer_kv]
-            from .. import quant as _kvq
 
-            if _kvq.KVQ is not None:
-                _kvq.check_compat(cfg)
-                st._kvq_layers = [_split_kv(kvc) for kvc in layer_kv]
-                print(
-                    f"[locks] KVQ ARMED: {_kvq.KVQ.describe()} (engine K/V views stashed, {len(layer_kv)} layers)",
-                    flush=True,
-                )
             self._state = st
             if not getattr(cfg, "mem_summary_cache", False):
                 self._ensure_overlap(sfc)

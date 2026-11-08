@@ -10,7 +10,6 @@ from .build import (
     _stack_key_pages,
 )
 from .rki4_state import IBITS, QMAX, QMIN, RNK, Rki4State
-from .. import quant as _kvq
 from .rki4_state import MUC as _MUC
 
 _EIGH_CHUNK = int(os.environ.get("LOCKS_EIGH_CHUNK", "8192"))
@@ -119,15 +118,7 @@ def _rki4_write(
     )
     ok = (bidx >= 0) & (bidx < nb)
     (Kp_flat, lidx, bidx) = (Kp_flat[ok], lidx[ok], bidx[ok])
-    tag_override = None
-    if _kvq.KVQ is not None:
-        hooked = _kvq.build_hook(st, Kp_flat, lidx, bidx)
-        if hooked is None:
-            return
-        (Kp_flat, tag_override, lidx, bidx) = hooked
     (tag_new, mu, dc, Gm) = _write_pre(st, Kp_flat)
-    if tag_override is not None:
-        tag_new = tag_override
     (S2, U) = _eigh_chunked(Gm.reshape(-1, st.page, st.page))
     _write_post(st, mu, dc, S2, U, tag_new, lidx, bidx)
 

@@ -21,6 +21,8 @@ def _read_spec():
 
 
 def _resolve(data):
+    if os.environ.get("LOCKS_KVQ", "off").strip().lower() not in ("", "off", "0", "none"):
+        raise ValueError("The retired fake-KV-quantization study is not part of the optimized runtime")
     rank = int(data.get("r8_rank", os.environ.get("LOCKS_RKI4_RANK", "4")))
     if rank not in (2, 4, 8):
         raise ValueError("The optimized selector supports ranks 2, 4 and 8")
