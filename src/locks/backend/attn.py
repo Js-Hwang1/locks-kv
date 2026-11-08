@@ -159,10 +159,6 @@ class LocksAttentionImpl(FlashAttentionImpl):
                         _ACT["dense_reasons"][key] = (
                             _ACT["dense_reasons"].get(key, 0) + n_dec
                         )
-            if _runtime._FIXC and _runtime.fixc_pending():
-                raise RuntimeError(
-                    "locks FIXC: deferred kv/rope pending on a delegated (non-locks) attention path -- wiring bug"
-                )
             return super().forward(
                 layer,
                 query,
@@ -294,9 +290,7 @@ class LocksAttentionImpl(FlashAttentionImpl):
 
         (_State, _derive, select_pages, _gs) = _runtime.resolve_selection()
         derive_page_params(st, sl_dec, n_dec)
-        st._q_preroped = True
         select_pages(q_dec, kv_cache, bt_dec, sl_dec, st, n_dec, self.scale, cfg)
-        _runtime._qf2_refs = None
         _runtime.decode_dispatch(
             q_dec,
             kv_cache,
@@ -378,7 +372,6 @@ class LocksAttentionImpl(FlashAttentionImpl):
         _dbg = _os.environ.get("LOCKS_MEM_DEBUG") == "1"
         side_done = False
         st_use = st
-        st_use._q_preroped = True
         select_pages(
             query, kv_cache, m.block_table, m.seq_lens, st_use, n_req, self.scale, cfg
         )
@@ -521,7 +514,6 @@ class LocksAttentionImpl(FlashAttentionImpl):
             out_dec = torch.empty_like(q_dec)
             (_State, _derive, select_pages, _gs) = _runtime.resolve_selection()
             derive_page_params(st, sl_dec, n_dec)
-            st._q_preroped = True
             select_pages(q_dec, kv_cache, bt_dec, sl_dec, st, n_dec, self.scale, cfg)
             mem_dynamic_decode(
                 q_dec,
