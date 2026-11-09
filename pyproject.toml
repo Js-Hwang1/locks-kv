@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "locks-kv"
-version = "0.1.5.dev20261108"
+version = "0.1.5.dev20261109"
 description = "LOCKS: Page-Local Compact Key Summaries for efficient long-context decoding -- optimized GQA and MLA page selection with optional host-backed GQA KV"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,6 +34,7 @@ classifiers = [
 dependencies = [
   "torch>=2.4",
   "triton>=3.0",
+  "ninja>=1.11",
 ]
 
 [project.optional-dependencies]

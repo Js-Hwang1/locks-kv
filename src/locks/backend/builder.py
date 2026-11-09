@@ -324,7 +324,6 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 raise RuntimeError(
                     "locks mem: enable_prefix_caching is unsupported (a cache hit resumes with prior context the lease never saw)"
                 )
-            pass
         if self._cfg is None:
             return
         if self._cfg.is_mem:
@@ -341,30 +340,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 flush=True,
             )
             return
-        try:
-            max_reqs = vllm_config.scheduler_config.max_num_seqs
-            max_model_len = vllm_config.model_config.max_model_len
-            bs = self.block_size
-            max_pages = (max_model_len + bs - 1) // bs
-            n_kv = self.num_heads_kv
-            G = self.num_heads_q // n_kv
-            self._state = State(
-                device, self._cfg, max_reqs, n_kv, G, self.headdim, max_pages, 128
-            )
-            ensure_stage_b_buffers(self._state, device, 128)
-            print(
-                f"[locks] BRIDGE buffers: reqs={max_reqs} n_kv={n_kv} G={G} d={self.headdim} max_pages={max_pages} split={128} graph_safe={graph_safe}",
-                flush=True,
-            )
-        except Exception as e:
-            print(
-                "[locks] bridge buffer alloc FAILED -- refusing the silent stock-FA/FullKV delegation:",
-                flush=True,
-            )
-            traceback.print_exception(type(e), e, e.__traceback__)
-            raise RuntimeError(
-                f"locks: bridge Stage-A buffer allocation failed ({type(e).__name__}: {e}). No FullKV fallback under the locks tag -- run LOCKS_DISABLE=1 for the reference line."
-            ) from e
+        raise RuntimeError("LOCKS requires the graph-safe optimized selector")
 
     def _ensure_state(self):
         if self._state is not None or not self._r8:

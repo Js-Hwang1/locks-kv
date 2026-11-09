@@ -80,7 +80,21 @@ rank-4 summaries, registered CPU huge pages, exact host allocation sizes,
 guarded incremental staging, overlapped transfer scheduling, and attention
 metadata prefetch. Release/acquire publication and the eviction fence protect
 original K/V while transfers overlap decode. The allocator binds its host
-mapping to CPU NUMA node 0; the measured platform is GH200.
+mapping to CPU NUMA node 0 by default; the measured platform is GH200.
+On a PCIe H200 host, set `LOCKS_HOST_NUMA_NODE` to the CPU NUMA node nearest
+the selected GPU. Inspect `nvidia-smi topo -m` and `numactl --hardware` to choose
+a CPU node with DRAM, not a GPU memory NUMA node. The setting applies before
+allocation and appears in the host-pool description. Linux `libnuma.so.1` and
+permission to bind memory to that node are required.
+
+For example, only if the selected GPU is attached to CPU NUMA node 1:
+
+```sh
+export LOCKS_HOST_NUMA_NODE=1
+```
+
+The same registered-host storage and optimized transport kernels are used on
+PCIe. GH200 throughput measurements do not establish H200 PCIe throughput.
 
 The rank-4 selector payload is 490 bytes per page per KV head; the packed
 physical record is 512 bytes including tags and padding. Rank-8's logical
@@ -120,8 +134,7 @@ from the GH200/GLM performance measurements.
 - `src/locks/tier/`: host storage, staging, cache residency, transfers, and offloaded attention.
 - `tests/`: independent reference calculations and regression checks.
 
-The pre-cleanup source is preserved on
-`archive/pre-optimized-canonical-20261108`. Accepted experiment snapshots are
+The pre-cleanup source remains in Git history at `80de3a9`. Accepted experiment snapshots are
 kept separately from this package; historical implementations are not bundled
 as alternative runtime paths.
 
@@ -133,6 +146,10 @@ python tests/check_selection.py --report /tmp/locks_selection.json
 python tests/check_shared_average.py --report /tmp/locks_shared_average.json
 python tests/check_mla.py --report /tmp/locks_mla.json
 ```
+
+`python tests/check_host_numa.py` checks host-node selection and a small Linux
+CPU-memory binding without allocating GPU memory. Run the GPU checks on an
+idle device; do not run them alongside latency measurements.
 
 The MLA check uses synthetic latent KV and does not establish full-model
 DeepSeek correctness or performance. The measured GLM configurations exercise
