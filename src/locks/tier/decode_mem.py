@@ -70,10 +70,23 @@ def _mem_decode_split_kernel(
     PUBLISH_COPY: tl.constexpr = False,
     PREFETCH_META: tl.constexpr = False,
     META_PAD: tl.constexpr = 16,
+    FILL_CACHE: tl.constexpr = False,
+    CACHE_SLOT_BITS: tl.constexpr = 0,
+    CACHE_DISPATCH: tl.constexpr = 0,
 ):
     r = tl.program_id(0)
     kh = tl.program_id(1)
     sp = tl.program_id(2)
+    if CACHE_DISPATCH:
+        # Separate kernels keep cached heads on the original fast path.
+        # GPU counters select the path without a host synchronization.
+        misses = tl.load(mail_cnt_ptr + kh)
+        if CACHE_DISPATCH == 1:
+            if misses > 0:
+                return
+        else:
+            if misses == 0:
+                return
     cnt = tl.load(cnt_ptr + r * stride_cntr + kh)
     pps = tl.maximum(tl.cdiv(cnt, SPLIT), PPS_MIN)
     j0 = sp * pps
@@ -165,8 +178,15 @@ def _mem_decode_split_kernel(
                         else:
                             tl.store(p2s_ptr + kh * t_NB + blk, -1)
                             tl.store(ovf_ptr, 1)
+        cache_slot = tl.maximum(slot, 0)
+        if FILL_CACHE:
+            encoded = -slot - 3
+            cache_slot = tl.where(
+                slot < -2, encoded & ((1 << CACHE_SLOT_BITS) - 1), cache_slot
+            )
+            copy_page = (slot < -2) & ((encoded >> CACHE_SLOT_BITS) == r)
         hot_off = (
-            (kh * t_S + tl.maximum(slot, 0)).to(tl.int64) * (PAGE * D)
+            (kh * t_S + cache_slot).to(tl.int64) * (PAGE * D)
             + offs_t[:, None] * D
             + offs_d[None, :]
         )
@@ -208,6 +228,12 @@ def _mem_decode_split_kernel(
         v = tl.load(vp, mask=tmask[:, None], other=0, cache_modifier=LOAD_CACHE).to(
             tl.bfloat16, bitcast=True
         )
+        if FILL_CACHE:
+            # The owning request stores the exact KV it already loaded for
+            # attention. Publication happens after this entire kernel ends.
+            if copy_page:
+                tl.store(hotk_ptr + hot_off, k.to(tl.int16, bitcast=True), mask=tmask[:, None])
+                tl.store(hotv_ptr + hot_off, v.to(tl.int16, bitcast=True), mask=tmask[:, None])
         s = tl.dot(q, tl.trans(k)).to(tl.float32) * sm_scale
         s = tl.where(tmask[None, :], s, float("-inf"))
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -238,6 +264,7 @@ def mem_decode_ptrsel(
     *,
     scale: float = None,
     k5c: bool = False,
+    fused_fill: bool = False,
 ) -> None:
     if scale is None:
         scale = st.scale
@@ -277,6 +304,10 @@ def mem_decode_ptrsel(
         (_epoch, _clock) = (r5.clock, r5.clock)
         (_valid, _gen) = (r5.clock, r5.clock)
         (_mail, _mcnt, _ovf, _mcap) = (r5.clock, r5.clock, r5.clock, 0)
+    if fused_fill:
+        # The asynchronous K5 mailbox is inactive for PCIe fills; reuse this
+        # kernel argument for the per-head miss counts instead.
+        _mcnt = tier.pcie_cache.counts
     max_selected = st.page_table.shape[2]
     if getattr(st, "budget_abs", 0) > 0:
         max_selected = min(
@@ -285,66 +316,70 @@ def mem_decode_ptrsel(
     # Keep the scratch strides and reduction order, but do not launch blocks
     # that cannot own any selected pages under the configured budget.
     grid_split = min(split, triton.cdiv(max_selected, pps_min))
-    _mem_decode_split_kernel[n_req, n_kv, grid_split](
-        q,
-        block_table,
-        st.page_table,
-        st.page_cnt,
-        seq_lens,
-        st.m_part,
-        st.l_part,
-        st.acc_part,
-        scale,
-        q.stride(0),
-        q.stride(1),
-        kres,
-        skb,
-        skt,
-        skh,
-        r5.hot_i16[lidx],
-        hotk,
-        vp16,
-        kp16,
-        vp16.stride(0),
-        vp16.stride(1),
-        vp16.stride(2),
-        tier.pool.dev_view,
-        poolk,
-        r5.page2slot[lidx],
-        stg.vbo,
-        block_table.stride(0),
-        st.page_table.stride(0),
-        st.page_table.stride(1),
-        st.page_cnt.stride(0),
-        st.m_part.stride(0),
-        lidx,
-        r5.NB,
-        r5.S,
-        _epoch,
-        _clock,
-        _valid,
-        _gen,
-        _mail,
-        _mcnt,
-        _ovf,
-        _mcap,
-        G=G,
-        G_PAD=max(16, triton.next_power_of_2(G)),
-        PAGE=r5.page,
-        D=d,
-        SPLIT=split,
-        PPS_MIN=pps_min,
-        K_TIER=1 if has_k else 0,
-        NKV=n_kv,
-        K5C=bool(k5c),
-        LOAD_CACHE="",
-        PIPELINE_STAGES=4,
-        PUBLISH_COPY=True,
-        PREFETCH_META=True,
-        META_PAD=triton.next_power_of_2(max(pps_min, triton.cdiv(max_selected, split))),
-        launch_pdl=bool(False),
-        num_warps=4,
-    )
+    for fill_mode in ((1, 2) if fused_fill else (0,)):
+        _mem_decode_split_kernel[n_req, n_kv, grid_split](
+            q,
+            block_table,
+            st.page_table,
+            st.page_cnt,
+            seq_lens,
+            st.m_part,
+            st.l_part,
+            st.acc_part,
+            scale,
+            q.stride(0),
+            q.stride(1),
+            kres,
+            skb,
+            skt,
+            skh,
+            r5.hot_i16[lidx],
+            hotk,
+            vp16,
+            kp16,
+            vp16.stride(0),
+            vp16.stride(1),
+            vp16.stride(2),
+            tier.pool.dev_view,
+            poolk,
+            r5.page2slot[lidx],
+            stg.vbo,
+            block_table.stride(0),
+            st.page_table.stride(0),
+            st.page_table.stride(1),
+            st.page_cnt.stride(0),
+            st.m_part.stride(0),
+            lidx,
+            r5.NB,
+            r5.S,
+            _epoch,
+            _clock,
+            _valid,
+            _gen,
+            _mail,
+            _mcnt,
+            _ovf,
+            _mcap,
+            G=G,
+            G_PAD=max(16, triton.next_power_of_2(G)),
+            PAGE=r5.page,
+            D=d,
+            SPLIT=split,
+            PPS_MIN=pps_min,
+            K_TIER=1 if has_k else 0,
+            NKV=n_kv,
+            K5C=bool(k5c),
+            LOAD_CACHE="",
+            PIPELINE_STAGES=1 if fill_mode == 2 else 4,
+            PUBLISH_COPY=not fused_fill,
+            FILL_CACHE=fill_mode == 2,
+            CACHE_DISPATCH=fill_mode,
+            CACHE_SLOT_BITS=(r5.S - 1).bit_length(),
+            PREFETCH_META=True,
+            META_PAD=triton.next_power_of_2(max(pps_min, triton.cdiv(max_selected, split))),
+            launch_pdl=bool(False),
+            num_warps=4,
+        )
     merge_splits_kernel[n_req, n_kv * G](
         st.m_part,
         st.l_part,
@@ -389,7 +424,8 @@ def mem_dynamic_decode(
     if tier.pcie_cache is not None:
         tier.pcie_cache.prepare(lidx, st.page_table, st.page_cnt, block_table, seq_lens)
         mem_decode_ptrsel(q, kv_cache, block_table, seq_lens, st, out, tier, lidx,
-                          scale=scale, k5c=False)
+                          scale=scale, k5c=False, fused_fill=tier.pcie_cache.fused)
+        tier.pcie_cache.finish(lidx)
         return
     from .k5 import _K5_STATS
 

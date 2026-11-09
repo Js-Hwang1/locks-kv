@@ -1,9 +1,9 @@
 """Layer-local cache fills for PCIe hosts.
 
 All phases run on the attention stream: protect selected hot pages, assign
-unprotected slots, fill misses, then attend. Kernel boundaries fence eviction
-and publication. Original KV is transferred once, without a background copy
-of pages that attention has already read over PCIe.
+unprotected slots, attend while filling misses, then publish the new mappings.
+Kernel boundaries fence eviction and publication. Original KV is transferred
+once and the attention kernel also stores its unchanged bytes in the hot cache.
 """
 import torch
 import triton
@@ -39,7 +39,7 @@ def _mark_selected(TAB, CNT, BT, SL, P2S, EPOCH, CLOCK, VBO, VALID,
         # A shared prefix may appear in several requests. Claim it once.
         old = _masked_cas(P2S + unit * NB + block,
                           tl.full((BLOCK,), -1, tl.int32),
-                          tl.full((BLOCK,), -2, tl.int32), candidate)
+                          tl.full((BLOCK,), -2, tl.int32) - r, candidate)
         claimed = candidate & (old == -1)
         flags = claimed.to(tl.int32)
         n = tl.sum(flags, 0)
@@ -53,7 +53,9 @@ def _mark_selected(TAB, CNT, BT, SL, P2S, EPOCH, CLOCK, VBO, VALID,
 @triton.jit
 def _assign_slots(BLOCKS, SLOTS, COUNTS, P2S, S2P, EPOCH, HAND, CLOCK,
                   SCRATCH, NB, S, LAYER, NK: tl.constexpr,
-                  CAP: tl.constexpr, BLOCK: tl.constexpr):
+                  CAP: tl.constexpr, BLOCK: tl.constexpr,
+                  REUSE_STEPS: tl.constexpr = 8, SLOT_BITS: tl.constexpr = 0,
+                  FUSED: tl.constexpr = False):
     h = tl.program_id(0)
     unit = LAYER * NK + h
     count = tl.load(COUNTS + h)
@@ -65,12 +67,17 @@ def _assign_slots(BLOCKS, SLOTS, COUNTS, P2S, S2P, EPOCH, HAND, CLOCK,
         index = off + lanes
         need = index < count
         block = tl.load(BLOCKS + h * CAP + index, mask=need, other=0)
-        while (tl.sum(need.to(tl.int32), 0) > 0) & (spent < S):
-            advance = tl.minimum(BLOCK, S - spent)
+        while (tl.sum(need.to(tl.int32), 0) > 0) & (spent < 2 * S):
+            # Prefer pages unused over several decode steps. A second pass
+            # relaxes this preference, but never evicts a current selection.
+            first_pass = spent < S
+            limit = tl.where(first_pass, S, 2 * S)
+            advance = tl.minimum(BLOCK, limit - spent)
             scanned = lanes < advance
             slot = (cursor + lanes) % S
             epoch = tl.load(EPOCH + unit * S + slot, mask=scanned, other=clock)
-            free = scanned & (epoch < clock)
+            cutoff = clock - tl.where(first_pass, REUSE_STEPS, 0)
+            free = scanned & ((epoch == 0) | (epoch < cutoff))
             free_i = free.to(tl.int32)
             free_rank = tl.cumsum(free_i, 0) - free_i
             nfree = tl.sum(free_i, 0)
@@ -86,6 +93,12 @@ def _assign_slots(BLOCKS, SLOTS, COUNTS, P2S, S2P, EPOCH, HAND, CLOCK,
             tl.store(S2P + unit * S + chosen, block, mask=take)
             tl.store(EPOCH + unit * S + chosen, clock, mask=take)
             tl.store(SLOTS + h * CAP + index, chosen, mask=take)
+            if FUSED:
+                # Encode the sole copying request and its slot. Other requests
+                # sharing this page may read host KV but cannot race the copy.
+                owner = -tl.load(P2S + unit * NB + block, mask=take, other=-2) - 2
+                tl.store(P2S + unit * NB + block,
+                         -3 - chosen - (owner << SLOT_BITS), mask=take)
             need = need & ~take
             cursor = (cursor + advance) % S
             spent += advance
@@ -123,6 +136,10 @@ class PcieCache:
         return 4 * n_kv * (2 * capacity + 1 + 256)
 
     def __init__(self, tier, selected_page_capacity):
+        self.slot_bits = (tier.residency.S - 1).bit_length()
+        # Very large geometries retain the explicit fill path rather than
+        # overflowing the int32 owner/slot encoding.
+        self.fused = tier.residency.R * (1 << self.slot_bits) < 2**31 - 3
         self.tier = tier
         self.capacity = tier.residency.R * selected_page_capacity
         self.blocks = torch.empty((tier.n_kv, self.capacity), dtype=torch.int32, device=tier.device)
@@ -146,9 +163,31 @@ class PcieCache:
         _assign_slots[(t.n_kv,)](
             self.blocks, self.slots, self.counts, res.page2slot, res.slot2page,
             res.lru_clock, res.hand, res.clock, self.scratch, t.NB, res.S, layer,
-            NK=t.n_kv, CAP=self.capacity, BLOCK=256, num_warps=4)
-        grid = min(256, self.capacity)
-        _fill_cache[grid, t.n_kv](
-            self.blocks, self.slots, self.counts, t.pool_k.dev_view, t.pool.dev_view,
-            res.hot_k_i16, res.hot_i16, res.page2slot, t.NB, res.S, layer,
-            NK=t.n_kv, PAGE=t.page, D=t.d, CAP=self.capacity, GRID=grid, num_warps=4)
+            NK=t.n_kv, CAP=self.capacity, BLOCK=256, SLOT_BITS=self.slot_bits,
+            FUSED=self.fused, num_warps=4)
+        if not self.fused:
+            grid = min(256, self.capacity)
+            _fill_cache[grid, t.n_kv](
+                self.blocks, self.slots, self.counts, t.pool_k.dev_view, t.pool.dev_view,
+                res.hot_k_i16, res.hot_i16, res.page2slot, t.NB, res.S, layer,
+                NK=t.n_kv, PAGE=t.page, D=t.d, CAP=self.capacity, GRID=grid, num_warps=4)
+
+    def finish(self, layer):
+        if not self.fused:
+            return
+        t = self.tier
+        _publish_cache[(t.n_kv,)](self.blocks, self.slots, self.counts,
+            t.residency.page2slot, t.NB, layer, NK=t.n_kv, CAP=self.capacity,
+            BLOCK=128, num_warps=4)
+
+
+@triton.jit
+def _publish_cache(BLOCKS, SLOTS, COUNTS, P2S, NB, LAYER,
+                   NK: tl.constexpr, CAP: tl.constexpr, BLOCK: tl.constexpr):
+    h = tl.program_id(0)
+    count = tl.load(COUNTS + h)
+    for off in range(0, count, BLOCK):
+        index = off + tl.arange(0, BLOCK)
+        slot = tl.load(SLOTS + h * CAP + index, mask=index < count, other=-1)
+        block = tl.load(BLOCKS + h * CAP + index, mask=slot >= 0, other=0)
+        tl.store(P2S + (LAYER * NK + h) * NB + block, slot, mask=slot >= 0)

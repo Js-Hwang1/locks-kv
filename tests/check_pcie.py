@@ -24,12 +24,13 @@ torch.set_num_threads(2)
 L, R, NK, G, P, D, MP, C, SPLIT = 2, 2, 4, 8, 16, 128, 257, 16, 128
 rows = []
 
-for hot_slots in (64, 7):
+for hot_slots, fused in ((64, True), (7, True), (64, False), (7, False)):
     cfg = LocksConfig(variant='mem-kv', budget_pages=C-2, hot_slots=hot_slots,
                       mem_transport='pcie')
     tier = Tier.from_config(cfg, num_layers=L, num_blocks=R*MP, n_kv=NK,
         page=P, d=D, max_reqs=R, max_pages=MP, max_tokens=R+8,
         dtype=torch.bfloat16, device=torch.device('cuda'))
+    tier.pcie_cache.fused = fused  # Also exercise the large-geometry fallback.
     k = torch.randn((L,R*MP,NK,P,D), device='cuda', dtype=torch.bfloat16)
     v = torch.randn_like(k)
     tier.pool_k.host.copy_(k)
@@ -52,13 +53,14 @@ for hot_slots in (64, 7):
         acc_part=torch.zeros((R,NK,SPLIT,G,D),device='cuda'))
     output = torch.empty((L,R,NK*G,D),device='cuda',dtype=torch.bfloat16)
 
-    def decode(layer):
-        mem_decode_ptrsel(q,None,bt,sl,st,output[layer],tier,layer,scale=1/math.sqrt(D))
+    def decode(layer, fused_fill=False):
+        mem_decode_ptrsel(q,None,bt,sl,st,output[layer],tier,layer,scale=1/math.sqrt(D), fused_fill=fused_fill)
 
     def prepare_and_decode():
         for layer in range(L):
             tier.pcie_cache.prepare(layer,tab,cnt,bt,sl)
-            decode(layer)
+            decode(layer, fused_fill=tier.pcie_cache.fused)
+            tier.pcie_cache.finish(layer)
 
     # Warm all kernels before capture; empty rows must remain safe.
     cnt.zero_()
@@ -91,6 +93,13 @@ for hot_slots in (64, 7):
         graph.replay()
         torch.cuda.synchronize()
         assert torch.equal(output,before), ('PCIe fill changed attention',hot_slots,iteration)
+        # Replaying the same selection exercises the no-miss kernel as well
+        # as the fill kernel. Staged partial pages must remain readable.
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(output,before), ('Warm-cache attention changed',hot_slots,iteration)
+        if hot_slots == 64:
+            assert not bool(tier.pcie_cache.counts.any()), 'Expected a fully cached replay'
         physical = bt[:,None,:].expand(R,NK,MP).gather(2,tab[:,:,:C].long()).long()
         heads = torch.arange(NK,device='cuda')[None,:,None]
         tokens = (tab[:,:,:C].long()[:,:,:,None]*P+torch.arange(P,device='cuda')).flatten(-2)
@@ -105,7 +114,7 @@ for hot_slots in (64, 7):
             error = float((output[layer].float()-expected).abs().max())
             maximum_error = max(maximum_error,error)
             assert torch.isfinite(output[layer]).all() and error < 0.012, (hot_slots,iteration,layer,error)
-        assert not bool((tier.residency.page2slot == -2).any())
+        assert not bool((tier.residency.page2slot < -1).any())
         tier.residency.assert_maps_inverse()
         for layer in range(L):
             for head in range(NK):
@@ -113,7 +122,8 @@ for hot_slots in (64, 7):
                 slots = tier.residency.page2slot[layer,head,blocks].long()
                 assert torch.equal(tier.residency.hot_k[layer,head,slots],k[layer,blocks,head])
                 assert torch.equal(tier.residency.hot[layer,head,slots],v[layer,blocks,head])
-    rows.append(dict(hot_slots=hot_slots,graph_replays=8,layers=L,
+    rows.append(dict(hot_slots=hot_slots,fused_attention_fill=fused,graph_replays=16,layers=L,
+                     includes_warm_cache_replay=True,
                      bitwise_equal_to_direct_original_kv=True,
                      max_absolute_float32_reference_error=maximum_error,passed=True))
     del graph,tier,k,v
