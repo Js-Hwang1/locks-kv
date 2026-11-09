@@ -1494,12 +1494,12 @@ def _lowbatch_mult(n_req, max_pages, G, d):
 
 
 def rki4_score_only(st, layer, q, block_table, seq_lens, n_req, scale):
-    z = st.zsplit or auto_zsplit(
+    z = st.zsplit or (128 if getattr(st, "low_context", False) else auto_zsplit(
         n_req,
         st.n_kv,
         st.max_pages,
         mult=_lowbatch_mult(n_req, st.max_pages, st.G, st.d),
-    )
+    ))
     if int(block_table.shape[1]) < int(st.max_pages):
         st.score_h.zero_()
     elif st.pp_rec is not None:

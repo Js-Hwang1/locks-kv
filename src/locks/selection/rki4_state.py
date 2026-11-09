@@ -68,6 +68,7 @@ class Rki4State:
         tagw: int = TAGW,
         combine: str = "shared_average",
         zsplit=None,
+        resident_low_context=False,
     ):
         assert window_pages >= 1, (
             "window_pages>=1: the partial tail must live inside the always-attended window so the selectable region is exact"
@@ -93,7 +94,9 @@ class Rki4State:
         self.device = device
         (u8, i8, bf16) = (torch.uint8, torch.int8, torch.bfloat16)
         (i32, f32, f64) = (torch.int32, torch.float32, torch.float64)
-        packed = _AOS or (
+        self.low_context = bool(resident_low_context and R == 1 and RNK == 4
+            and D == 128 and page == 16 and G == 8 and 1024 <= MP <= 8192)
+        packed = _AOS or self.low_context or (
             R == 1 and RNK == 4 and D == 128 and page == 16 and G == 8
             and MP >= 16384
         )

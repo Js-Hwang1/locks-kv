@@ -221,6 +221,10 @@ def complete_current_and_combine(
 
     validate_policy_environment()
     tier = _runtime.get_tier()
+    if getattr(st, "low_context", False) and tier is None:
+        from .small_shared_average import complete
+        return complete(st, n_req, q=q, kv_cache=kv_cache, block_table=block_table,
+            seq_lens=seq_lens, scale=scale, layer=layer)
     staged = tier is not None and tier.offload_k
     if staged:
         key = tier.staging.k_pool[layer]

@@ -397,6 +397,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 budget_pages=cfg.budget_pages,
                 sink_pages=cfg.sink_pages,
                 window_pages=cfg.window_pages,
+                resident_low_context=not cfg.is_mem,
                 **extra_state,
             )
             st.D = st.d
@@ -410,6 +411,8 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 self._layer_k = [_split_kv(kvc)[0] for kvc in layer_kv]
 
             self._state = st
+            if st.low_context and os.environ.get("LOCKS_DEBUG_GATE", "0") != "1":
+                self._maybe_refresh = self._refresh_single
             if not getattr(cfg, "mem_summary_cache", False):
                 self._ensure_overlap(sfc)
             print(
@@ -744,6 +747,38 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
                 self._tail_refresh(st, md, n_req, rows)
             need_derive = fired
         return need_derive
+
+    def _refresh_single(self, st, md, cam, n_req):
+        sl_cpu = _seq_lens_host(cam)
+        qs_cpu = getattr(cam, "query_start_loc_cpu", None)
+        if (n_req != 1 or sl_cpu is None or qs_cpu is None or qs_cpu.shape[0] < 2
+                or sl_cpu.device.type != "cpu" or qs_cpu.device.type != "cpu"):
+            self._single_previous = None
+            return type(self)._maybe_refresh(self, st, md, cam, n_req)
+        cur = int(sl_cpu[0])
+        settled = max(0, cur - (int(qs_cpu[1]) - int(qs_cpu[0])))
+        previous = getattr(self, "_single_previous", None)
+        self._single_previous = (cur, settled)
+        if previous is not None:
+            old_cur, old_settled = previous
+            advanced = cur == old_cur + 1 and settled == old_settled + 1
+            padded = cur == old_cur == 0
+            frozen = cur == old_cur and settled == old_settled
+            if advanced or padded or frozen:
+                crossed = advanced and settled % self.block_size == 0
+                if crossed:
+                    rows = getattr(self, "_single_row_cpu", None)
+                    if rows is None:
+                        rows = self._single_row_cpu = torch.tensor([0], dtype=torch.int64)
+                    self._tail_refresh(st, md, n_req, self._rows_to_device(rows))
+                return crossed
+        settled_dev = self._settled_dev(md, n_req)
+        if self._built_once:
+            self._delta_refresh(st, md, n_req, settled // self.block_size, settled=settled_dev)
+        else:
+            self._bulk_refresh(st, md, n_req, settled // self.block_size, settled=settled_dev)
+            self._built_once = True
+        return True
 
     def _rows_to_device(self, idx):
         k = idx.shape[0]

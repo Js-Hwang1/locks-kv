@@ -26,11 +26,13 @@ def _get():
 def select(st, n_req, tile=None):
     if not n_req:
         return
+    cap = st.budget_abs or max(1, int(st.max_pages * st.budget + 1))
     preferred = 2048 if st.max_pages <= 2048 else 1024
     if 8192 < st.max_pages <= 32768:
         preferred = 2048
+    if getattr(st, "low_context", False) and 2048 < st.max_pages <= 4096 and cap <= 126:
+        preferred = 4096
     tile = int(tile or os.environ.get("LOCKS_TOPK_TILE", str(preferred)))
-    cap = st.budget_abs or max(1, int(st.max_pages * st.budget + 1))
     while tile < 2 * cap and tile < 4096:
         tile *= 2
     if tile < 2 * cap:

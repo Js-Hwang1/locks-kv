@@ -23,13 +23,13 @@ from locks.selection.select_cuda import topb_select_cuda
 torch.set_num_threads(1)
 torch.manual_seed(20261109)
 rows = []
-for max_pages in (8193, 16384, 32777):
+for max_pages in (1033, 2057, 4105, 8193, 16384, 32777):
     geometry = dict(device='cuda', num_layers=1, num_blocks=151, n_kv=4,
         G=8, head_dim=128, page=16, max_pages=max_pages, rank=4, budget_pages=126)
     reference = Rki4State(max_reqs=2, **geometry)
-    candidate = Rki4State(max_reqs=1, **geometry)
+    candidate = Rki4State(max_reqs=1, resident_low_context=True, **geometry)
     assert reference.pp_rec is None
-    packed = max_pages >= 16384
+    packed = max_pages <= 8192 or max_pages >= 16384
     assert (candidate.pp_rec is not None) == packed
     keys = torch.randn(151, 16, 4, 128, device='cuda', dtype=torch.bfloat16)
     original = keys.clone()
@@ -72,7 +72,7 @@ for max_pages in (8193, 16384, 32777):
         torch.cuda.synchronize()
         assert torch.equal(reference.page_table[0], candidate.page_table[0])
         assert torch.equal(keys, original)
-        rows.append(dict(max_pages=max_pages, visible_tokens=visible, packed=packed,
+        rows.append(dict(max_pages=max_pages, visible_tokens=visible, packed=packed, low_context=candidate.low_context,
             scores_bitwise_equal=True, shares_bitwise_equal=True,
             selected_ids_bitwise_equal=True, original_keys_unchanged=True))
 a.report.write_text(json.dumps(dict(passed=True, seed=20261109, rows=rows), indent=2) + '\n')

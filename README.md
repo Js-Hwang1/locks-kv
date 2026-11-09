@@ -69,11 +69,21 @@ normalization, and query-head unions are not runtime alternatives.
 
 Resident batch-1 engines automatically use the packed scorer for rank 4,
 16-token pages, 128-dimensional heads, eight queries per KV head, and a
-configured capacity of at least 16,384 pages. It uses the existing asynchronous
+configured capacity of 1,024–8,192 pages or at least 16,384 pages. It uses the existing asynchronous
 summary prefetch and tensor-core centroid computation. The quantized values,
 scores, shared selections, and original-KV attention remain identical to the
 separate-array layout. Other resident geometries and the batched offloaded
 dispatch keep their existing paths.
+
+The 1,024–8,192-page resident path also fuses current-page scoring with the
+first normalization reduction, and combines the remaining normalization with
+the GQA vote. Its scorer uses 128 grid partitions unless explicitly configured.
+At 2,049–4,096 pages and at most 126 dynamic slots, the existing exact top-k
+kernel uses a 4,096-page tile. Single-request metadata refresh uses CPU scalar
+state instead of vector tensor operations. These specializations preserve the
+all-visible-page normalization and stable page-ID tie break. They do not change
+the 128K-and-larger tested context configurations, offloaded execution, or
+engines configured for more than one concurrent request.
 
 This layout stores 512 bytes per page/KV head: 490 bytes of selector payload,
 16 bytes of tags, a 2-byte coefficient norm bound, and 4 bytes of padding.
@@ -159,6 +169,7 @@ python tests/check_selection.py --report /tmp/locks_selection.json
 python tests/check_shared_average.py --report /tmp/locks_shared_average.json
 python tests/check_mla.py --report /tmp/locks_mla.json
 python tests/check_batch1_packed.py --report /tmp/locks_batch1_packed.json
+python tests/check_host_refresh.py --report /tmp/locks_host_refresh.json
 ```
 
 `python tests/check_host_numa.py` checks host-node selection and a small Linux
