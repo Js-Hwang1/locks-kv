@@ -91,7 +91,16 @@ def build_plan(vllm_config, cfg: LocksConfig) -> MemPlan:
     G = mc.get_num_attention_heads(pc) // max(n_kv, 1) or 1
     parts = max_reqs * n_kv * 128 * G * (4 + 4 + d * 4)
     scratch = max_reqs * n_kv * max_pages * (4 + 4 + 4 * G + 4 * 3 + 12) + (1 << 20)
-    fixed = hot + staging + lease + parts + scratch + _SLACK_BYTES
+    pcie_workspace = 0
+    if cfg.mem_transport == "pcie":
+        from ..tier.pcie import PcieCache
+
+        selected = (
+            min(max_pages, cfg.budget_pages + cfg.sink_pages + cfg.window_pages)
+            if cfg.budget_pages else max_pages
+        )
+        pcie_workspace = PcieCache.workspace_bytes(n_kv, max_reqs * selected)
+    fixed = hot + staging + lease + parts + scratch + pcie_workspace + _SLACK_BYTES
     full_kv_layer_block = page * n_kv * d * elem
     host_per_block = full_kv_layer_block * L * kv_mult
     return MemPlan(
@@ -105,6 +114,7 @@ def build_plan(vllm_config, cfg: LocksConfig) -> MemPlan:
             lease=lease,
             parts=parts,
             scratch=scratch,
+            pcie_workspace=pcie_workspace,
             slack=_SLACK_BYTES,
             rec_bytes=rec_bytes,
             hot_slots=hot_slots,

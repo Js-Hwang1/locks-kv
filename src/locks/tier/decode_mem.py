@@ -282,7 +282,9 @@ def mem_decode_ptrsel(
         max_selected = min(
             max_selected, st.budget_abs + st.sink_pages + st.window_pages
         )
-    grid_split = split
+    # Keep the scratch strides and reduction order, but do not launch blocks
+    # that cannot own any selected pages under the configured budget.
+    grid_split = min(split, triton.cdiv(max_selected, pps_min))
     _mem_decode_split_kernel[n_req, n_kv, grid_split](
         q,
         block_table,
@@ -384,6 +386,11 @@ def mem_dynamic_decode(
         raise ValueError(
             "Only the optimized pointer-selection attention path is available"
         )
+    if tier.pcie_cache is not None:
+        tier.pcie_cache.prepare(lidx, st.page_table, st.page_cnt, block_table, seq_lens)
+        mem_decode_ptrsel(q, kv_cache, block_table, seq_lens, st, out, tier, lidx,
+                          scale=scale, k5c=False)
+        return
     from .k5 import _K5_STATS
 
     fused = seq_lens.shape[0] == 1 and (not _K5_STATS) and (not tier_stepped)

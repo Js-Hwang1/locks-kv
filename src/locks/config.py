@@ -27,6 +27,9 @@ class LocksConfig:
     max_pool_gb: float = 256.0
     mem_k_only: bool = True
     mem_summary_cache: bool = False
+    # PCIe fills selected misses on the attention stream before using them.
+    # The default retains the validated overlapped transport on coherent hosts.
+    mem_transport: Literal["async", "pcie"] = "async"
     use_cuda: bool = True
     force_eager: bool = False
 
@@ -45,6 +48,10 @@ class LocksConfig:
             )
         if self.variant not in ("fast", "mem-v", "mem-kv"):
             raise ValueError(f"unknown variant {self.variant!r}")
+        if self.mem_transport not in ("async", "pcie"):
+            raise ValueError("mem_transport must be 'async' or 'pcie'")
+        if self.mem_transport == "pcie" and self.variant != "mem-kv":
+            raise ValueError("mem_transport='pcie' requires full-KV offloading")
         if self.offload_k and (not self.r8_screen):
             object.__setattr__(self, "r8_screen", True)
         if not 0.0 < self.coverage <= 1.0:

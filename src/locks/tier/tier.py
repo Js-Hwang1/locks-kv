@@ -28,6 +28,8 @@ class Tier:
         max_pool_gb: float = 256.0,
         offload_k: bool = False,
         summary_cache: bool = False,
+        mem_transport: str = "async",
+        selected_page_capacity: int | None = None,
     ):
         (self.L, self.NB, self.n_kv) = (num_layers, num_blocks, n_kv)
         (self.page, self.d) = (page, d)
@@ -35,6 +37,8 @@ class Tier:
         self.dtype = dtype
         self.offload_k = offload_k
         self.summary_cache = bool(summary_cache)
+        self.mem_transport = mem_transport
+        self.pcie_cache = None
         self.pool = MappedHostVPool(
             num_layers=num_layers,
             num_blocks=num_blocks,
@@ -90,6 +94,12 @@ class Tier:
         self.fm_ctr = torch.zeros(
             (max_reqs * n_kv,), dtype=torch.int32, device=self.device
         )
+        if mem_transport == "pcie":
+            if not offload_k:
+                raise ValueError("PCIe cache fills require full-KV offloading")
+            from .pcie import PcieCache
+
+            self.pcie_cache = PcieCache(self, selected_page_capacity or max_pages)
 
     @staticmethod
     def recommend_hot_slots(
@@ -165,6 +175,11 @@ class Tier:
             max_pool_gb=cfg.max_pool_gb,
             offload_k=cfg.offload_k,
             summary_cache=bool(getattr(cfg, "mem_summary_cache", False)),
+            mem_transport=cfg.mem_transport,
+            selected_page_capacity=(
+                min(max_pages, cfg.budget_pages + cfg.sink_pages + cfg.window_pages)
+                if cfg.budget_pages else max_pages
+            ),
         )
 
     def begin_step(
@@ -179,17 +194,18 @@ class Tier:
         self._cur_mql = int(max_query_len)
         self._cur_nreq = int(seq_lens.shape[0])
         if not capture:
-            if getattr(self, "_early_serviced", False):
-                self._early_serviced = False
-                svc = self._k5_service()
-                zp = getattr(svc, "_zev_pending", None)
-                if zp is not None:
-                    torch.cuda.current_stream(self.device).wait_event(zp)
-                    svc._zev_pending = None
-            else:
-                self._k5_service().service()
+            if self.pcie_cache is None:
+                if getattr(self, "_early_serviced", False):
+                    self._early_serviced = False
+                    svc = self._k5_service()
+                    zp = getattr(svc, "_zev_pending", None)
+                    if zp is not None:
+                        torch.cuda.current_stream(self.device).wait_event(zp)
+                        svc._zev_pending = None
+                else:
+                    self._k5_service().service()
             self.residency.invalidate_written(block_table, seq_lens, query_start_loc)
-            if self.residency.R > 1:
+            if self.pcie_cache is None and self.residency.R > 1:
                 from .k5 import _K5_PROMO1
 
                 if _K5_PROMO1:
@@ -356,6 +372,8 @@ class Tier:
         return svc
 
     def early_service(self) -> None:
+        if self.pcie_cache is not None:
+            return
         if not getattr(self, "_early_announced", False):
             self._early_announced = True
             print("[locks] K5_EARLY: first early service fired", flush=True)

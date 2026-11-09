@@ -186,6 +186,9 @@ def _patch_profiling_window() -> None:
 
 
 def _wire_k5_early() -> None:
+    if _runtime.get_config().mem_transport == "pcie":
+        print("[locks] PCIe transport ACTIVE: selected misses filled before attention", flush=True)
+        return
     from . import attnwire
 
     def _cb(model, vllm_config):
