@@ -2,7 +2,7 @@ from __future__ import annotations
 from .config import LocksConfig
 
 __all__ = ["LocksConfig", "register"]
-__version__ = "0.1.5.dev20261109"
+__version__ = "0.1.6.dev20261109"
 
 
 def register(overrides=None) -> None:

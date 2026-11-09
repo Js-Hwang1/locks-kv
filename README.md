@@ -67,6 +67,19 @@ same native query INT8 round-trip as the summary scorer. Sparse attention uses
 original BF16 queries, keys, and values. Candidate-only normalization, peak
 normalization, and query-head unions are not runtime alternatives.
 
+Resident batch-1 engines automatically use the packed scorer for rank 4,
+16-token pages, 128-dimensional heads, eight queries per KV head, and a
+configured capacity of at least 16,384 pages. It uses the existing asynchronous
+summary prefetch and tensor-core centroid computation. The quantized values,
+scores, shared selections, and original-KV attention remain identical to the
+separate-array layout. Other resident geometries and the batched offloaded
+dispatch keep their existing paths.
+
+This layout stores 512 bytes per page/KV head: 490 bytes of selector payload,
+16 bytes of tags, a 2-byte coefficient norm bound, and 4 bytes of padding.
+The separate-array layout stores the same selector payload and tags in
+506 bytes. Use the state's `bytes_per_layer()` for its actual allocation.
+
 ## Host-backed GQA
 
 Use `variant="mem-kv"` to keep the complete K/V store in CPU memory, or
@@ -145,6 +158,7 @@ explicit report destination:
 python tests/check_selection.py --report /tmp/locks_selection.json
 python tests/check_shared_average.py --report /tmp/locks_shared_average.json
 python tests/check_mla.py --report /tmp/locks_mla.json
+python tests/check_batch1_packed.py --report /tmp/locks_batch1_packed.json
 ```
 
 `python tests/check_host_numa.py` checks host-node selection and a small Linux

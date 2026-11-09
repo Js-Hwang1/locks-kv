@@ -1425,17 +1425,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m_) {
 
 }
 """
-_MOD = None
+_MOD = {}
 _SMS = None
 _NOROPE = False
 GMX = 8
 
 
-def _get(verbose=False):
-    global _MOD
-    if _MOD is None:
+def _get(verbose=False, *, packed=None):
+    from .rki4_state import RNK, _AOS
+
+    if packed is None:
+        packed = _AOS
+    if packed not in _MOD:
         from torch.utils.cpp_extension import load_inline
-        from .rki4_state import RNK, _AOS
 
         if not _arch.is_hopper():
             raise RuntimeError(
@@ -1456,16 +1458,16 @@ def _get(verbose=False):
             "-DRKI4_PFR_CONTIG",
             "-DRKI4_PFR_EARLY",
         ]
-        if _AOS:
+        if packed:
             flags += ["-DRKI4_MMA_AOS", "-DRKI4_MMA_MUC", "-DRKI4_MMA_PFR"]
-        _MOD = load_inline(
-            name="locks_rki4_score",
+        _MOD[packed] = load_inline(
+            name="locks_rki4_score_packed" if packed else "locks_rki4_score",
             cpp_sources="",
             cuda_sources=_SRC,
             extra_cuda_cflags=flags,
             verbose=verbose,
         )
-    return _MOD
+    return _MOD[packed]
 
 
 def _sm_count() -> int:
@@ -1501,7 +1503,7 @@ def rki4_score_only(st, layer, q, block_table, seq_lens, n_req, scale):
     if int(block_table.shape[1]) < int(st.max_pages):
         st.score_h.zero_()
     elif st.pp_rec is not None:
-        _get().rki4_score_bt_aos(
+        _get(packed=True).rki4_score_bt_aos(
             q,
             st.pp_rec[layer],
             block_table,
@@ -1513,7 +1515,7 @@ def rki4_score_only(st, layer, q, block_table, seq_lens, n_req, scale):
         )
     else:
         (v4, vs, c8, cs, mu8, mus, _tag) = st.layer_state(layer)
-        _get().rki4_score_bt(
+        _get(packed=False).rki4_score_bt(
             q,
             v4,
             vs,

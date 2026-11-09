@@ -30,14 +30,14 @@ def _v_bytes(d: int) -> int:
     return RNK * ((d * IBITS + 7) // 8)
 
 
-def record_bytes(d: int, page: int, tagw: int = TAGW) -> int:
-    if _AOS:
+def record_bytes(d: int, page: int, tagw: int = TAGW, *, packed=None) -> int:
+    if packed is None:
+        packed = _AOS
+    if packed:
         assert d == 128 and page == 16, "AOS records cover the p16 d128 flagship only"
         assert IBITS == 4, "AOS records cover the i4 flagship only"
-        if _COMPACT_TAGS:
-            assert tagw == TAGW == 8
-            return _REC_BYTES
-        return _REC_BYTES + tagw * 2
+        assert tagw == TAGW == 8
+        return _REC_BYTES
     return _v_bytes(d) + RNK * 2 + page * RNK + page * 2 + d + 2 + tagw * 2
 
 
@@ -93,7 +93,12 @@ class Rki4State:
         self.device = device
         (u8, i8, bf16) = (torch.uint8, torch.int8, torch.bfloat16)
         (i32, f32, f64) = (torch.int32, torch.float32, torch.float64)
-        if _AOS:
+        packed = _AOS or (
+            R == 1 and RNK == 4 and D == 128 and page == 16 and G == 8
+            and MP >= 16384
+        )
+        self.packed_summaries = packed
+        if packed:
             assert D == 128 and page == 16, (
                 "AOS records cover the p16 d128 flagship only"
             )
@@ -125,7 +130,7 @@ class Rki4State:
             self.pp_cs = torch.zeros(L, NB, n_kv, page, device=device, dtype=bf16)
             self.pp_mu8 = torch.zeros(L, NB, n_kv, D, device=device, dtype=i8)
             self.pp_mus = torch.zeros(L, NB, n_kv, device=device, dtype=bf16)
-        if _COMPACT_TAGS:
+        if packed:
             assert tagw == TAGW == 8
             tag_start = _REC_BYTES - 2 * tagw
             assert tag_start % 16 == 0 and o_mus + 4 <= tag_start
@@ -148,7 +153,7 @@ class Rki4State:
         self.share_logz = torch.empty(R, n_kv, G, device=device, dtype=f32)
         self.b_fix = torch.ones(R, device=device, dtype=i32)
         self.budget64 = torch.tensor([self.budget], device=device, dtype=f64)
-        planned = record_bytes(D, page, tagw) * n_kv * NB
+        planned = record_bytes(D, page, tagw, packed=packed) * n_kv * NB
         actual = self.bytes_per_layer()
         assert actual == planned, (
             f"rki4 slab bytes/layer {actual} != record_bytes() plan {planned} (d={D} page={page} tagw={tagw} n_kv={n_kv} NB={NB}) -- update rki4_state.record_bytes to match the allocation"
@@ -178,9 +183,7 @@ class Rki4State:
 
     def bytes_per_layer(self) -> int:
         if self.pp_rec is not None:
-            return self.pp_rec[0].numel() + (
-                0 if _COMPACT_TAGS else self.pp_tag[0].numel() * 2
-            )
+            return self.pp_rec[0].numel()
         return (
             self.pp_v4[0].numel()
             + self.pp_vs[0].numel() * 2
