@@ -26,6 +26,15 @@ def _get():
 def select(st, n_req, tile=None):
     if not n_req:
         return
+    if (getattr(st, "low_context", False) and n_req == 1 and st.G == 4 and st.n_kv == 8
+            and st.sink_pages == 1 and st.window_pages == 1 and st.budget_abs in (2, 6)):
+        from .small_topk import select_small
+        import triton
+        select_small[(8,)](st.score, st.page_table, st.page_cnt, st.n_pages, st.max_pages,
+            st.budget_abs + 2, st.page_table.stride(1), True, triton.next_power_of_2(st.max_pages),
+            True, num_warps=4)
+        st._topb_done = False
+        return
     cap = st.budget_abs or max(1, int(st.max_pages * st.budget + 1))
     preferred = 2048 if st.max_pages <= 2048 else 1024
     if 8192 < st.max_pages <= 32768:

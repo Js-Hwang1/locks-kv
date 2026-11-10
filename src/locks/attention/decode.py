@@ -64,6 +64,9 @@ def ensure_stage_b_buffers(st, device, split: int) -> None:
         float(getattr(st, "budget", 0.1) or 0.1),
         split,
     )
+    if getattr(st, "low_context", False) and R == 1 and n_kv == 8 and G == 4 and D == 128 and st.max_pages <= 4096 and getattr(st, "budget_abs", 0):
+        slots = st.budget_abs + st.sink_pages + st.window_pages
+        split = min(split, triton.next_power_of_2(max(1, triton.cdiv(slots, 2))))
     st.split = split
     st.m_part = torch.empty(R, n_kv, split, G, device=device, dtype=f32)
     st.l_part = torch.empty(R, n_kv, split, G, device=device, dtype=f32)
@@ -227,6 +230,15 @@ def sparse_paged_decode_batched(
     (skb, skt, skh) = (k_ptr.stride(0), k_ptr.stride(1), k_ptr.stride(2))
     (hotk_ptr, poolk_ptr) = (v_ptr, v_ptr)
     (_, page, n_kv, d) = k_ptr.shape
+    slots = st.budget_abs + st.sink_pages + st.window_pages if getattr(st, "budget_abs", 0) else 0
+    if getattr(st, "low_context", False) and n_req == 1 and n_kv == 8 and G == 4 and d == 128 and page == 16 and st.max_pages <= 4096 and vsource.SRC_ID == 0 and slots in (4, 8, 16):
+        from .compact import compact_selected_attention
+        compact_selected_attention[(32,)](
+            q, k_ptr, v_ptr, block_table, st.page_table, st.page_cnt, seq_lens, out,
+            skb, skt, skh, svb, svt, svh, st.page_table.stride(1), True, True,
+            slots * 16, float(scale), num_warps=4 if slots <= 8 else 8,
+        )
+        return
     sparse_decode_split_kernel[n_req, n_kv, split](
         q,
         k_ptr,

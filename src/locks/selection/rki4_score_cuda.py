@@ -149,7 +149,11 @@ void rki4_score_kernel(
     constexpr int MUW = DHEAD / 32;
 
 
+#ifdef RKI4_G4_MMA
+    constexpr bool USE_MMA = (G8 || (G4 && PGT == 16 && RNK == 4)) && (DHEAD == 128);
+#else
     constexpr bool USE_MMA = G8 && (DHEAD == 128);
+#endif
     constexpr bool PIPE = (DHEAD < 256) && G4 && !USE_MMA;
 
 
@@ -242,8 +246,16 @@ void rki4_score_kernel(
             q8d[gg][j] = wd;
         }
     }
+    if constexpr (G4 && USE_MMA) {
+        for (int i = tid; i < 4 * DHEAD / 8; i += TB) {
+            q8e[4 + i / (DHEAD / 8)][i % (DHEAD / 8)] = 0;
+            q8o[4 + i / (DHEAD / 8)][i % (DHEAD / 8)] = 0;
+        }
+        for (int i = tid; i < 4 * DHEAD / 4; i += TB)
+            q8d[4 + i / (DHEAD / 4)][i % (DHEAD / 4)] = 0;
+        if (tid < 4) qsc[4 + tid] = 0.f;
+    }
     __syncthreads();
-
 
     unsigned Af[4][4];
     int qsum_mma = 0;
@@ -1431,12 +1443,13 @@ _NOROPE = False
 GMX = 8
 
 
-def _get(verbose=False, *, packed=None):
+def _get(verbose=False, *, packed=None, g4_mma=False):
     from .rki4_state import RNK, _AOS
 
     if packed is None:
         packed = _AOS
-    if packed not in _MOD:
+    key = (packed, g4_mma)
+    if key not in _MOD:
         from torch.utils.cpp_extension import load_inline
 
         if not _arch.is_hopper():
@@ -1460,14 +1473,18 @@ def _get(verbose=False, *, packed=None):
         ]
         if packed:
             flags += ["-DRKI4_MMA_AOS", "-DRKI4_MMA_MUC", "-DRKI4_MMA_PFR"]
-        _MOD[packed] = load_inline(
-            name="locks_rki4_score_packed" if packed else "locks_rki4_score",
+        if g4_mma:
+            assert packed and RNK == 4
+            flags += ["-DRKI4_G4_MMA"]
+        name = "locks_rki4_score_g4_mma_guarded" if g4_mma else ("locks_rki4_score_packed_guarded" if packed else "locks_rki4_score_guarded")
+        _MOD[key] = load_inline(
+            name=name,
             cpp_sources="",
             cuda_sources=_SRC,
             extra_cuda_cflags=flags,
             verbose=verbose,
         )
-    return _MOD[packed]
+    return _MOD[key]
 
 
 def _sm_count() -> int:
@@ -1494,7 +1511,8 @@ def _lowbatch_mult(n_req, max_pages, G, d):
 
 
 def rki4_score_only(st, layer, q, block_table, seq_lens, n_req, scale):
-    z = st.zsplit or (128 if getattr(st, "low_context", False) else auto_zsplit(
+    low_z = 64 if st.g4_mma else 128
+    z = st.zsplit or (low_z if getattr(st, "low_context", False) else auto_zsplit(
         n_req,
         st.n_kv,
         st.max_pages,
@@ -1503,7 +1521,7 @@ def rki4_score_only(st, layer, q, block_table, seq_lens, n_req, scale):
     if int(block_table.shape[1]) < int(st.max_pages):
         st.score_h.zero_()
     elif st.pp_rec is not None:
-        _get(packed=True).rki4_score_bt_aos(
+        _get(packed=True, g4_mma=st.g4_mma).rki4_score_bt_aos(
             q,
             st.pp_rec[layer],
             block_table,

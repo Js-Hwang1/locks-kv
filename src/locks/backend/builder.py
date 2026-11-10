@@ -300,6 +300,7 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
         self._state = None
         self._derive = None
         self._r8 = False
+        self._qwen_decode_fast_build = False
         self._capturing = False
         self._layer_kv = None
         self._layer_k = None
@@ -334,6 +335,13 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
         (State, derive, _select, graph_safe) = _runtime.resolve_selection()
         self._r8 = graph_safe
         self._derive = derive
+        self._qwen_decode_fast_build = bool(
+            graph_safe and not self._cfg.is_mem and self._cfg.r8_rank == 4
+            and vllm_config.scheduler_config.max_num_seqs == 1
+            and self.num_heads_q == 32 and self.num_heads_kv == 8
+            and self.headdim == 128 and self.block_size == 16
+            and 16384 <= vllm_config.model_config.max_model_len <= 131072
+        )
         if self._r8:
             print(
                 "[locks] r8 selection WIRED (graph-safe); R8State + layer map deferred to first build (num_gpu_blocks not set yet)",
@@ -610,6 +618,9 @@ class LocksMetadataBuilder(FlashAttentionMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         if _NVTX:
             _nvtx_push("locks.fa_build")
+        fast_build = fast_build or (
+            self._qwen_decode_fast_build and common_attn_metadata.max_query_len == 1
+        )
         md = super().build(common_prefix_len, common_attn_metadata, fast_build)
         if _NVTX:
             _nvtx_pop()

@@ -95,7 +95,8 @@ class Rki4State:
         (u8, i8, bf16) = (torch.uint8, torch.int8, torch.bfloat16)
         (i32, f32, f64) = (torch.int32, torch.float32, torch.float64)
         self.low_context = bool(resident_low_context and R == 1 and RNK == 4
-            and D == 128 and page == 16 and G == 8 and 1024 <= MP <= 8192)
+            and D == 128 and page == 16 and (G == 8 or (G == 4 and n_kv == 8)) and 1024 <= MP <= 8192)
+        self.g4_mma = self.low_context and G == 4 and n_kv == 8
         packed = _AOS or self.low_context or (
             R == 1 and RNK == 4 and D == 128 and page == 16 and G == 8
             and MP >= 16384

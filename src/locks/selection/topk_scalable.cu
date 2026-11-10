@@ -10,7 +10,7 @@ __device__ unsigned ordered_score(float f) {
 }
 
 template<int TILE, bool FIRST, bool LAST>
-__global__ void locks_topk_radix_reduce(
+__device__ __forceinline__ void locks_topk_radix_body(
     const float* score, const unsigned long long* input,
     unsigned long long* output, const int* npg, const int* nsh,
     const int* budgets, int* table, int* counts,
@@ -146,6 +146,34 @@ __global__ void locks_topk_radix_reduce(
             table[tb+lo+wanted+i-recent_start] = i;
         if (tid == 0) counts[r*count_r+h] = lo+wanted+n-recent_start;
     }
+}
+
+template<int TILE, bool FIRST, bool LAST>
+__global__ void locks_topk_radix_reduce(
+    const float* score, const unsigned long long* input,
+    unsigned long long* output, const int* npg, const int* nsh,
+    const int* budgets, int* table, int* counts,
+    long score_r, long score_h, long table_r, long table_h, long count_r,
+    int mp, int input_n, int output_n, int kv, int sink, int cap)
+{
+    if constexpr (TILE == 4096 && FIRST && LAST) {
+        if (kv == 8 && gridDim.z == 1 && cap <= 126) {
+            int n = npg[blockIdx.z];
+            if (n <= 1024) {
+                locks_topk_radix_body<1024,true,true>(score,input,output,npg,nsh,budgets,table,counts,score_r,score_h,table_r,table_h,count_r,mp,input_n,output_n,kv,sink,cap);
+                long offset=blockIdx.z*table_r+blockIdx.y*table_h;
+                for (int i=1024+threadIdx.x;i<mp;i+=256) table[offset+i]=-1;
+                return;
+            }
+            if (n <= 2048) {
+                locks_topk_radix_body<2048,true,true>(score,input,output,npg,nsh,budgets,table,counts,score_r,score_h,table_r,table_h,count_r,mp,input_n,output_n,kv,sink,cap);
+                long offset=blockIdx.z*table_r+blockIdx.y*table_h;
+                for (int i=2048+threadIdx.x;i<mp;i+=256) table[offset+i]=-1;
+                return;
+            }
+        }
+    }
+    locks_topk_radix_body<TILE,FIRST,LAST>(score,input,output,npg,nsh,budgets,table,counts,score_r,score_h,table_r,table_h,count_r,mp,input_n,output_n,kv,sink,cap);
 }
 
 template<int TILE, bool FIRST, bool LAST>

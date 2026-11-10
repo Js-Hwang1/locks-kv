@@ -99,7 +99,7 @@ def _write_post(st: Rki4State, mu, dc, S2, U, tag_new, lidx, bidx) -> None:
     c8q = Cq.to(torch.int8)
     st.pp_c8[lidx, bidx] = c8q
     st.pp_cs[lidx, bidx] = csc.to(torch.bfloat16)
-    if st.pp_rec is not None and st.G == 8:
+    if st.pp_rec is not None and (st.G == 8 or st.g4_mma):
         muq = torch.cat([muq[..., 0::2], muq[..., 1::2]], dim=-1)
     st.pp_mu8[lidx, bidx] = muq.to(torch.int8)
     st.pp_mus[lidx, bidx] = msc.to(torch.bfloat16)

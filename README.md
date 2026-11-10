@@ -85,6 +85,57 @@ all-visible-page normalization and stable page-ID tie break. They do not change
 the 128K-and-larger tested context configurations, offloaded execution, or
 engines configured for more than one concurrent request.
 
+Original Qwen3-4B's eight KV heads and four query heads per KV head also use
+the resident batch-1 packed rank-4 path at capacities of 1,024–8,192 pages.
+Its scorer uses INT8 tensor-core instructions with 64 grid partitions. The
+centroid permutation only changes byte order. Synthetic checks match selected
+page IDs and bound the scorer's floating-point difference below 5e-7.
+At capacities up to 4,096 pages, total budgets of 64/128 tokens use an exact
+small-K selector, and 64/128/256 use direct FP32 selected-original-KV attention
+with BF16 output. Larger budgets bound inactive attention splits by the attended
+budget. FP32 attention is checked independently; bitwise-identical generated
+trajectories are not promised. GLM's eight-query-head path, higher-capacity
+paths, multiple-request engines, and offloaded dispatch retain their existing
+implementations.
+
+For this Qwen batch-one resident geometry, decode metadata skips the unused
+dense FA3 scheduling kernel. Prefill retains native dense scheduling. The
+guard includes rank four, 16-token pages, 128-dimensional heads and engine
+capacities from 16K through 128K tokens; it does not affect offloaded or
+multiple-request engines.
+
+For a single request with eight KV heads and at most 126 dynamic slots, the
+4,096-page top-k tile dispatches on the visible page count inside the graph.
+It uses a 1,024- or 2,048-page tile for shorter prefixes and retains the
+4,096-page implementation for longer ones. Selected IDs, stable tie breaking,
+mandatory slots and unused table entries are unchanged. The independent test
+`tests/check_qwen_adaptive_topk.py --output <new-directory>` checks changing
+prefix lengths under one captured graph, including tied and infinite scores.
+
+Qwen latency measurements can additionally enable vLLM's compilation mode 3,
+`pass_config={"enable_qk_norm_rope_fusion": true}`, and
+`async_scheduling=True`, using `FULL_DECODE_ONLY`, `compile_sizes=[1]`, and
+`cudagraph_capture_sizes=[1]` for a batch-1 engine. These are shared engine
+optimizations, not selector-specific improvements; apply them to comparison
+methods as well. Count calls that return no token and the final request drain
+when measuring asynchronous execution. BF16 operation fusion can change
+rounding and sampled trajectories even with the same seed.
+
+On the validated GH200/PyTorch configuration, the generated FFN reduction
+also benefits from a fixed launch choice. The source hash
+`ce6af60bd9142654d7aae3e92430b68fd0392a4057b84215cbd9dbb735a0705b`
+uses `XBLOCK=4`, `R0_BLOCK=1024`, `num_warps=4`, and `num_stages=1`.
+An Inductor lookup table alone does not guarantee this choice after an AOT
+cache reload or subsequent autotuning. From this checkout, call
+`examples.qwen_ffn_launch.install()` before constructing the vLLM engine to
+select the matching compiled configuration and disable subsequent retuning
+for this exact operation. The helper is validated against PyTorch 2.11 and
+Triton 3.6; it is not installed automatically by LOCKS. Its `EVENTS` list
+records matching construction/cache-restore actions. A different compiler or
+model can produce a different hash. Apply the same helper and engine settings
+to dense controls. This is an FFN launch optimization, not a LOCKS selector
+improvement.
+
 This layout stores 512 bytes per page/KV head: 490 bytes of selector payload,
 16 bytes of tags, a 2-byte coefficient norm bound, and 4 bytes of padding.
 The separate-array layout stores the same selector payload and tags in
@@ -169,6 +220,7 @@ python tests/check_selection.py --report /tmp/locks_selection.json
 python tests/check_shared_average.py --report /tmp/locks_shared_average.json
 python tests/check_mla.py --report /tmp/locks_mla.json
 python tests/check_batch1_packed.py --report /tmp/locks_batch1_packed.json
+python tests/check_qwen_batch1.py --output /tmp/locks_qwen_batch1
 python tests/check_host_refresh.py --report /tmp/locks_host_refresh.json
 ```
 
